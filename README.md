@@ -70,7 +70,7 @@
 
 需要复制到 Cloudflare Workers 编辑器的完整代码位于：
 ```
-src/index.js
+index.js
 ```
 
 这个文件包含了：
