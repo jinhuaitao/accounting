@@ -216,7 +216,23 @@ export default {
   function calculateSummary(transactions, period = 'daily') {
     let income = 0, expense = 0;
     const now = new Date();
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    
+    // --- 修改部分：将 'daily' 范围改为北京时间 (UTC+8) 的 00:00:00 ---
+    const BJT_OFFSET = 8 * 60 * 60 * 1000; // 8 小时毫秒数
+    const utcNowMs = now.getTime();
+    const BJT_Ms = utcNowMs + BJT_OFFSET;
+    const BJT_Date = new Date(BJT_Ms);
+    
+    // 构造一个基于 BJT 日期的 00:00:00 的 UTC Date 对象
+    const BJT_Midnight = new Date(
+        BJT_Date.getUTCFullYear(), 
+        BJT_Date.getUTCMonth(), 
+        BJT_Date.getUTCDate()
+    );
+    // 减去偏移量，得到北京时间 00:00:00 对应的 UTC 时间
+    const today = new Date(BJT_Midnight.getTime() - BJT_OFFSET);
+    // ----------------------------------------------------------------
+    
     const dayOfWeek = now.getDay();
     const mondayOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
     const thisWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() + mondayOffset);
@@ -225,7 +241,7 @@ export default {
     
     const filtered = transactions.filter(t => {
       const d = new Date(t.timestamp);
-      if (period === 'daily') return d >= today;
+      if (period === 'daily') return d.getTime() >= today.getTime(); // 使用毫秒时间戳进行精确比较
       if (period === 'weekly') return d >= thisWeek;
       if (period === 'monthly') return d >= thisMonth;
       if (period === 'yearly') return d >= thisYear;
