@@ -97,7 +97,7 @@ export default {
     // 认证 API
     if (path === '/api/auth/login' && method === 'POST') {
       const { password } = await request.json();
-      const correctPassword = await kv.get('app_password') || '123456'; // 默认密码
+      const correctPassword = await kv.get('app_password') || 'admin123'; // 默认密码
       
       if (password === correctPassword) {
         const token = generateToken();
@@ -316,6 +316,51 @@ export default {
   }`;
   }
   
+  // 日期工具函数
+  function getWeekRange(date = new Date()) {
+    const d = new Date(date);
+    const dayOfWeek = d.getDay();
+    // 调整为周一（周日的偏移是-6，其他是1-dayOfWeek）
+    const mondayOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+    const monday = new Date(d.getFullYear(), d.getMonth(), d.getDate() + mondayOffset);
+    const sunday = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + 6);
+    
+    return {
+      start: monday,
+      end: sunday,
+      startString: monday.toLocaleDateString('zh-CN'),
+      endString: sunday.toLocaleDateString('zh-CN')
+    };
+  }
+  
+  function getMonthRange(date = new Date()) {
+    const year = date.getFullYear();
+    const month = date.getMonth();
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0); // 下个月的第0天就是这个月的最后一天
+    
+    return {
+      start: firstDay,
+      end: lastDay,
+      startString: firstDay.toLocaleDateString('zh-CN'),
+      endString: lastDay.toLocaleDateString('zh-CN'),
+      daysInMonth: lastDay.getDate()
+    };
+  }
+  
+  function getYearRange(date = new Date()) {
+    const year = date.getFullYear();
+    const firstDay = new Date(year, 0, 1);
+    const lastDay = new Date(year, 11, 31);
+    
+    return {
+      start: firstDay,
+      end: lastDay,
+      startString: firstDay.toLocaleDateString('zh-CN'),
+      endString: lastDay.toLocaleDateString('zh-CN')
+    };
+  }
+  
   // 生成简单的 token
   function generateToken() {
     return Math.random().toString(36).substring(2) + Date.now().toString(36);
@@ -327,7 +372,10 @@ export default {
     
     const now = new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const thisWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
+    // 修正周计算：周一至周日
+    const dayOfWeek = now.getDay();
+    const mondayOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek; // 周日时偏移-6天，其他偏移到周一
+    const thisWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() + mondayOffset);
     const thisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
     const thisYear = new Date(now.getFullYear(), 0, 1);
     
@@ -1989,22 +2037,22 @@ export default {
               <div class="summary-tabs">
                   <button class="summary-tab active" data-period="daily">
                       <span class="tab-icon">📅</span>
-                      <span class="tab-text">每日</span>
+                      <span class="tab-text">今日</span>
                       <span class="tab-date" id="dailyDate"></span>
                   </button>
                   <button class="summary-tab" data-period="weekly">
                       <span class="tab-icon">📊</span>
-                      <span class="tab-text">本周</span>
+                      <span class="tab-text">本周(周一至周日)</span>
                       <span class="tab-date" id="weeklyDate"></span>
                   </button>
                   <button class="summary-tab" data-period="monthly">
                       <span class="tab-icon">📆</span>
-                      <span class="tab-text">每月</span>
+                      <span class="tab-text">本月(1日至月末)</span>
                       <span class="tab-date" id="monthlyDate"></span>
                   </button>
                   <button class="summary-tab" data-period="yearly">
                       <span class="tab-icon">📈</span>
-                      <span class="tab-text">今年</span>
+                      <span class="tab-text">今年(1月至12月)</span>
                       <span class="tab-date" id="yearlyDate"></span>
                   </button>
               </div>
@@ -2152,6 +2200,7 @@ export default {
               const monthlyDate = document.getElementById('monthlyDate');
               const yearlyDate = document.getElementById('yearlyDate');
               
+              // 显示今日日期
               if (dailyDate) {
                   dailyDate.textContent = now.toLocaleDateString('zh-CN', { 
                       month: 'short', 
@@ -2159,35 +2208,41 @@ export default {
                   });
               }
               
+              // 显示本周日期范围（周一至周日）
               if (weeklyDate) {
-                  const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
-                  weeklyDate.textContent = weekStart.toLocaleDateString('zh-CN', { 
-                      month: 'short', 
-                      day: 'numeric' 
-                  });
+                  const weekRange = getWeekRange(now);
+                  const weekStart = weekRange.startString;
+                  const weekEnd = weekRange.endString;
+                  weeklyDate.textContent = weekStart.split('/').slice(1).join('/') + ' - ' + weekEnd.split('/').slice(1).join('/');
               }
               
+              // 显示本月日期范围（1日至月末）
               if (monthlyDate) {
-                  monthlyDate.textContent = now.toLocaleDateString('zh-CN', { 
-                      year: 'numeric', 
-                      month: 'short' 
-                  });
+                  const monthRange = getMonthRange(now);
+                  const monthStart = monthRange.startString;
+                  const monthEnd = monthRange.endString;
+                  const daysInMonth = monthRange.daysInMonth;
+                  monthlyDate.textContent = monthStart.split('/').slice(1).join('/') + ' - ' + monthEnd.split('/').slice(1).join('/') + ' (' + daysInMonth + '天)';
               }
               
+              // 显示今年日期范围（1月至12月）
               if (yearlyDate) {
-                  yearlyDate.textContent = now.getFullYear() + '年';
+                  const yearRange = getYearRange(now);
+                  const yearStart = yearRange.startString;
+                  const yearEnd = yearRange.endString;
+                  yearlyDate.textContent = yearStart + ' - ' + yearEnd;
               }
           }
   
           // 加载统计信息
           async function loadSummary(period = currentPeriod) {
               try {
-                  const response = await fetch(\`/api/summary?period=\${period}\`);
+                  const response = await fetch('/api/summary?period=' + period);
                   const summary = await response.json();
                   
-                  document.getElementById('periodIncome').textContent = \`¥\${summary.totalIncome.toFixed(2)}\`;
-                  document.getElementById('periodExpense').textContent = \`¥\${summary.totalExpense.toFixed(2)}\`;
-                  document.getElementById('periodBalance').textContent = \`¥\${summary.balance.toFixed(2)}\`;
+                  document.getElementById('periodIncome').textContent = '¥' + summary.totalIncome.toFixed(2);
+                  document.getElementById('periodExpense').textContent = '¥' + summary.totalExpense.toFixed(2);
+                  document.getElementById('periodBalance').textContent = '¥' + summary.balance.toFixed(2);
                   
                   currentPeriod = period;
                   updateDateDisplay(); // 更新日期显示
