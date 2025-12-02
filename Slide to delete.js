@@ -172,7 +172,7 @@ async function handleAPIRequest(request, env, path, method) {
 function getServiceWorker() {
   // 更改版本号，确保Service Worker更新
   return `
-const CACHE_NAME = 'accounting-app-v5'; 
+const CACHE_NAME = 'accounting-app-v6'; 
 const urlsToCache = ['/', '/manifest.json'];
 self.addEventListener('install', e => e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(urlsToCache))));
 self.addEventListener('fetch', e => {
@@ -1217,32 +1217,36 @@ function getHTML() {
                     const deleteThreshold = -itemWidth * 0.4; // 40% 宽度作为删除阈值
                     
                     if (currentOffset < deleteThreshold) { 
-                        // 1. 触发删除：先将内容区完全滑出
-                        content.style.transition = 'transform 0.4s ease-out';
-                        content.style.transform = \`translateX(-100%)\`; // 完全滑出视野
-                        
-                        // 2. 延迟后执行删除API和列表更新
-                        hapticFeedback();
-                        
-                        const id = item.dataset.id;
-                        
-                        await deleteItem(id); // 执行API删除操作 (已移除确认框)
-                        
-                        // 列表项平滑消失
-                        item.style.transition = 'opacity 0.3s ease 0.1s, margin 0.3s ease 0.1s, height 0.3s ease 0.1s, padding 0.3s ease 0.1s';
-                        item.style.opacity = '0';
-                        item.style.height = '0';
-                        item.style.margin = '0';
-                        item.style.padding = '0';
-                        
-                        // 重新加载 Summary (仅统计卡片)
-                        await loadSummaryOnly();
+                        // --- 修改部分：弹出确认框 ---
+                        if(confirm('确定删除这条记录吗？')) {
+                            // 用户点击"确定"，执行删除动画和API
+                            content.style.transition = 'transform 0.4s ease-out';
+                            content.style.transform = \`translateX(-100%)\`; // 完全滑出视野
+                            
+                            hapticFeedback();
+                            
+                            const id = item.dataset.id;
+                            
+                            await deleteItem(id); 
+                            
+                            // 列表项平滑消失
+                            item.style.transition = 'opacity 0.3s ease 0.1s, margin 0.3s ease 0.1s, height 0.3s ease 0.1s, padding 0.3s ease 0.1s';
+                            item.style.opacity = '0';
+                            item.style.height = '0';
+                            item.style.margin = '0';
+                            item.style.padding = '0';
+                            
+                            await loadSummaryOnly();
 
-                        // 实际移除 DOM 元素 (延迟到动画结束后)
-                        setTimeout(() => item.remove(), 400); 
+                            setTimeout(() => item.remove(), 400); 
+                        } else {
+                            // 用户点击"取消"，内容回弹复位
+                            content.style.transform = 'translateX(0)';
+                        }
+                        // --- 修改结束 ---
 
                     } else {
-                        // 3. 回弹
+                        // 未达到阈值，回弹
                         content.style.transform = 'translateX(0)';
                     }
                     
@@ -1282,11 +1286,7 @@ function getHTML() {
         };
 
         async function deleteItem(id) {
-            // 移除确认框，滑动操作即视为确认
-            // if(!confirm('确定删除这条记录吗？')) return; 
-            // hapticFeedback(); // 已经在滑动 touchend 中触发
             await fetch('/api/transactions/' + id, { method: 'DELETE' });
-            // 不再调用 loadData()，而是由 touchend 中的 UI 动画和 loadSummaryOnly 来完成更新
         }
         window.deleteItem = deleteItem; // 暴露给滑动逻辑调用
 
