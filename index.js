@@ -47,7 +47,6 @@ export default {
           return new Response(getManifest(), {
             headers: {
               'Content-Type': 'application/json',
-              // Manifest可以缓存
               'Cache-Control': 'public, max-age=86400',
             },
           });
@@ -58,7 +57,6 @@ export default {
           return new Response(getServiceWorker(), {
             headers: {
               'Content-Type': 'application/javascript',
-              // SW文件不应该被缓存，确保每次部署都能更新
               'Cache-Control': 'no-cache, no-store, must-revalidate',
             },
           });
@@ -145,7 +143,8 @@ export default {
         const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
         transactions.push(transaction);
         await kv.put(`transactions_${userId}`, JSON.stringify(transactions));
-        return new Response(JSON.stringify(transaction), { status: 201, headers: { 'Content-Type': 'application/json' } });
+        // 优化: 返回完整的更新后的列表，确保前端能立即渲染最新状态
+        return new Response(JSON.stringify(transactions), { status: 201, headers: { 'Content-Type': 'application/json' } });
       }
     }
   
@@ -154,7 +153,8 @@ export default {
       const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
       const filteredTransactions = transactions.filter(t => t.id !== transactionId);
       await kv.put(`transactions_${userId}`, JSON.stringify(filteredTransactions));
-      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+      // 优化: 删除后也返回完整的列表
+      return new Response(JSON.stringify(filteredTransactions), { headers: { 'Content-Type': 'application/json' } });
     }
   
     // --- API: 获取每月每日净流量曲线数据 (本月) ---
@@ -180,10 +180,9 @@ export default {
       return new Response(JSON.stringify(monthlyBalances), { headers: { 'Content-Type': 'application/json' } });
     }
     
-    // --- 🎯 新增 API: 获取每周每日净流量曲线数据 (本周) ---
+    // --- API: 获取每周每日净流量曲线数据 (本周) ---
     if (path === '/api/weekly_balance') {
       const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
-      // 不需要额外的参数，因为始终是“本周”
       const weeklyBalances = calculateWeeklyNetFlow(transactions);
       return new Response(JSON.stringify(weeklyBalances), { headers: { 'Content-Type': 'application/json' } });
     }
@@ -199,20 +198,18 @@ export default {
     return new Response('Not Found', { status: 404 });
   }
   
-  // --- 每日净流量 (Daily Net Flow - 本月) 逻辑 (保持不变) ---
+  // --- 每日净流量 (Daily Net Flow - 本月) 逻辑 ---
   function calculateDailyBalances(transactions, targetYear, targetMonth) {
       const monthlyTransactions = transactions.filter(t => {
           const d = new Date(t.timestamp);
           return d.getFullYear() === targetYear && d.getMonth() === targetMonth - 1; 
       }).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
   
-      // 获取当前日期 (BJT/KST 逻辑: UTC + 8小时)
       const now = new Date();
       const BJT_OFFSET = 8 * 60 * 60 * 1000;
       const utcNowMs = now.getTime();
       const BJT_Date = new Date(utcNowMs + BJT_OFFSET);
       
-      // 如果请求的月份和年份是未来，则不返回数据
       if (targetYear > BJT_Date.getUTCFullYear() || (targetYear === BJT_Date.getUTCFullYear() && targetMonth > BJT_Date.getUTCMonth() + 1)) {
           return [];
       }
@@ -221,7 +218,6 @@ export default {
       const dailyData = [];
       const maxDay = daysInMonth; 
   
-      // 1. 预计算每天的净流量
       const dailyNetFlows = {};
       monthlyTransactions.forEach(t => {
           const d = new Date(t.timestamp);
@@ -232,122 +228,76 @@ export default {
           dailyNetFlows[day] = (dailyNetFlows[day] || 0) + netAmount;
       });
   
-      // 2. 填充整个月的数据，并处理未来日期
       for (let day = 1; day <= maxDay; day++) {
           const dateKey = `${targetYear}-${String(targetMonth).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-          
           let dailyAmount = dailyNetFlows[day] || 0;
-          
-          // 核心逻辑：未来日期的金额设置为 0
           if (targetYear === BJT_Date.getUTCFullYear() && targetMonth === BJT_Date.getUTCMonth() + 1) {
-              if (day > BJT_Date.getUTCDate()) {
-                  dailyAmount = 0; // 未来日期，金额为 0
-              }
+              if (day > BJT_Date.getUTCDate()) { dailyAmount = 0; }
           }
-          
-          dailyData.push({
-              day: day,
-              date: dateKey,
-              balance: dailyAmount, // 'balance' 字段现在存储的是每日净流量
-          });
+          dailyData.push({ day: day, date: dateKey, balance: dailyAmount });
       }
-  
       return dailyData;
   }
   
-  
-  // --- 每月净流量 (Monthly Net Flow - 今年) 逻辑 (保持不变) ---
+  // --- 每月净流量 (Monthly Net Flow - 今年) 逻辑 ---
   function calculateMonthlyNetFlow(transactions, targetYear) {
-      // 获取当前日期 (BJT/KST 逻辑: UTC + 8小时)
       const now = new Date();
       const BJT_OFFSET = 8 * 60 * 60 * 1000;
       const utcNowMs = now.getTime();
       const BJT_Date = new Date(utcNowMs + BJT_OFFSET);
   
       const currentYear = BJT_Date.getUTCFullYear();
-      const currentMonth = BJT_Date.getUTCMonth() + 1; // 1-12
+      const currentMonth = BJT_Date.getUTCMonth() + 1;
   
-      // 如果请求的年份是未来，则不返回数据
-      if (targetYear > currentYear) {
-          return [];
-      }
+      if (targetYear > currentYear) return [];
   
-      // 1. 预计算每月的净流量
       const monthlyNetFlows = {};
       transactions.forEach(t => {
           const d = new Date(t.timestamp);
           const year = d.getFullYear();
-          const month = d.getMonth() + 1; // 1-12
+          const month = d.getMonth() + 1;
           
           if (year === targetYear) {
               const amount = parseFloat(t.amount);
-              // 净流量 = 收入金额 - 支出金额
               const netAmount = t.type === 'income' ? amount : -amount;
-              
               monthlyNetFlows[month] = (monthlyNetFlows[month] || 0) + netAmount;
           }
       });
   
       const monthlyData = [];
-  
-      // 2. 填充 1 月到 12 月的数据，并处理未来月份
       for (let month = 1; month <= 12; month++) {
           let monthlyAmount = monthlyNetFlows[month] || 0;
-          
-          // --- 核心逻辑：未来月份的金额设置为 0 ---
           if (targetYear === currentYear) {
-              if (month > currentMonth) {
-                  monthlyAmount = 0; // 未来月份，金额为 0
-              }
+              if (month > currentMonth) { monthlyAmount = 0; }
           }
-          
-          monthlyData.push({
-              month: month,
-              balance: monthlyAmount, // 'balance' 字段现在存储的是每月净流量
-          });
+          monthlyData.push({ month: month, balance: monthlyAmount });
       }
-  
       return monthlyData;
   }
   
-  
-  // --- 🎯 新增核心逻辑: 计算每周每日净流量 (Weekly Net Flow - 本周) ---
+  // --- 每周每日净流量 (Weekly Net Flow - 本周) ---
   function calculateWeeklyNetFlow(transactions) {
-      // 获取当前日期 (BJT/KST 逻辑: UTC + 8小时)
       const now = new Date();
       const BJT_OFFSET = 8 * 60 * 60 * 1000;
       const utcNowMs = now.getTime();
       const BJT_Date = new Date(utcNowMs + BJT_OFFSET);
   
-      // 计算本周的起始日期 (周一)
-      // getUTCDay() 返回 0 (周日) - 6 (周六)
       let dayOfWeek = BJT_Date.getUTCDay(); 
-      // 周日 (0) 偏移 -6；周一 (1) 偏移 0；周二 (2) 偏移 -1；...
       let mondayOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek; 
-      
-      // 设置到本周的周一的 UTC 日期
       const startOfWeek = new Date(Date.UTC(BJT_Date.getUTCFullYear(), BJT_Date.getUTCMonth(), BJT_Date.getUTCDate() + mondayOffset));
       
-      // 格式化日期为 YYYY-MM-DD，用于比较
       const formatDate = (d) => d.toISOString().substring(0, 10);
       const todayKey = formatDate(BJT_Date);
       
-      // 1. 初始化数据点
       const dayLabels = ['一', '二', '三', '四', '五', '六', '日'];
       const dataPoints = [];
   
       for (let i = 0; i < 7; i++) {
           const date = new Date(startOfWeek);
           date.setUTCDate(startOfWeek.getUTCDate() + i);
-          dataPoints.push({
-              day: dayLabels[i],
-              date: date,
-              balance: 0,
-              dateKey: formatDate(date)
-          });
+          dataPoints.push({ day: dayLabels[i], date: date, balance: 0, dateKey: formatDate(date) });
       }
   
-      // 2. 累加交易
       const dailyNetFlows = {};
       const weekStartKey = dataPoints[0].dateKey;
       const weekEndKey = dataPoints[6].dateKey;
@@ -355,38 +305,24 @@ export default {
       transactions.forEach(t => {
           const d = new Date(t.timestamp);
           const transactionDateKey = formatDate(d);
-          
-          // 过滤本周的交易
           if (transactionDateKey >= weekStartKey && transactionDateKey <= weekEndKey) {
               const amount = parseFloat(t.amount);
               const netAmount = t.type === 'income' ? amount : -amount;
-              
               dailyNetFlows[transactionDateKey] = (dailyNetFlows[transactionDateKey] || 0) + netAmount;
           }
       });
   
-      // 3. 填充数据并应用未来逻辑
       return dataPoints.map(dataPoint => {
           let dailyAmount = dailyNetFlows[dataPoint.dateKey] || 0;
-          
-          // 核心逻辑：未来日期的金额设置为 0
-          if (dataPoint.dateKey > todayKey) {
-              dailyAmount = 0; // 未来日期，金额为 0
-          }
-          
-          return {
-              day: dataPoint.day, // 周一, 周二...
-              balance: dailyAmount
-          };
+          if (dataPoint.dateKey > todayKey) { dailyAmount = 0; }
+          return { day: dataPoint.day, balance: dailyAmount };
       });
   }
   
-  
-  // --- 优化后的 getServiceWorker 函数 ---
+  // --- 优化后的 Service Worker: 关键修改点 (Network First) ---
   function getServiceWorker() {
-    // 优化: 更新版本号，添加 Chart.js 和字体文件到缓存列表
     return `
-  const CACHE_NAME = 'accounting-app-v9'; // 更新版本号
+  const CACHE_NAME = 'accounting-app-v10'; // 每次部署代码时增加版本号
   const urlsToCache = [
     '/', 
     '/manifest.json',
@@ -398,16 +334,14 @@ export default {
     e.waitUntil(
       caches.open(CACHE_NAME).then(c => c.addAll(urlsToCache).catch(err => console.error("Cache addAll failed:", err)))
     );
-    self.skipWaiting(); // 立即激活新 Worker
+    self.skipWaiting();
   });
   
   self.addEventListener('fetch', e => {
     const url = new URL(e.request.url);
     const isApi = url.pathname.startsWith('/api/');
-    const isTransactionApi = url.pathname.startsWith('/api/transactions') || url.pathname.startsWith('/api/summary') || url.pathname.startsWith('/api/daily_balance') || url.pathname.startsWith('/api/monthly_balance') || url.pathname.startsWith('/api/weekly_balance');
-  
-  
-    // 1. 缓存优先策略 (Cache First) - 用于静态资源
+    
+    // 1. 静态资源：缓存优先 (Cache First)
     if (urlsToCache.includes(url.pathname) || (url.origin === self.location.origin && urlsToCache.includes(url.pathname))) {
         e.respondWith(
             caches.match(e.request).then(response => response || fetch(e.request))
@@ -415,39 +349,39 @@ export default {
         return;
     }
     
-    // 2. Stale-While-Revalidate 策略 - 用于核心 API 数据
-    if (isApi && isTransactionApi) {
-      if (e.request.method !== 'GET') {
-        // 非GET请求（POST/DELETE/PUT）一律走网络
-        e.respondWith(fetch(e.request));
+    // 2. 核心 API 数据：网络优先 (Network First)
+    // 解决“必须刷新才能看到数据”的问题：优先请求最新数据，失败才用缓存
+    if (isApi) {
+        // 对于非 GET 请求 (POST/DELETE)，直接走网络，不缓存
+        if (e.request.method !== 'GET') {
+             e.respondWith(fetch(e.request));
+             return;
+        }
+
+        e.respondWith(
+            fetch(e.request)
+                .then(response => {
+                    // 网络请求成功，复制一份放入缓存供离线使用
+                    if (response.ok) {
+                        const responseClone = response.clone();
+                        caches.open(CACHE_NAME).then(cache => cache.put(e.request, responseClone));
+                    }
+                    return response;
+                })
+                .catch(() => {
+                    // 网络请求失败（离线），尝试读取缓存
+                    return caches.match(e.request).then(cachedResponse => {
+                        if (cachedResponse) return cachedResponse;
+                        return new Response(JSON.stringify({ error: 'Offline' }), { 
+                            status: 503, headers: { 'Content-Type': 'application/json' } 
+                        });
+                    });
+                })
+        );
         return;
-      }
-      
-      e.respondWith(
-        caches.open(CACHE_NAME).then(cache => {
-          return cache.match(e.request).then(cachedResponse => {
-            const fetchPromise = fetch(e.request).then(networkResponse => {
-              if (networkResponse.ok) {
-                cache.put(e.request, networkResponse.clone());
-              }
-              return networkResponse;
-            }).catch(error => {
-              console.warn("API network request failed:", error);
-              // 如果网络失败且没有缓存，则返回错误
-              if (!cachedResponse) {
-                 return new Response(JSON.stringify({ error: 'Offline and no cached data' }), { status: 503, headers: { 'Content-Type': 'application/json' } });
-              }
-            });
-            
-            // 立即返回缓存数据（如果有），同时发起网络请求
-            return cachedResponse || fetchPromise;
-          });
-        })
-      );
-      return;
     }
   
-    // 3. 默认：网络优先策略
+    // 3. 默认：网络优先
     e.respondWith(
       fetch(e.request).catch(() => caches.match(e.request))
     );
@@ -462,7 +396,6 @@ export default {
   });`;
   }
   
-  // --- 优化后的 getManifest 函数 ---
   function getManifest() {
     const iconBase64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgcng9IjEyOCIgZmlsbD0iIzBmMTcyYSIvPjxwYXRoIGZpbGw9IiNmZmYiIGQ9Ik0yNTYgMTI4bC0zMiA4MEgxMjhsODAgMzItODAgMzJoOTZsMzIgODBMMjU2IDQwMEwyODggMjU2aDk2bDMyLTgwaC05NnpNMjU2IDE5MmwzMiA4MGg5NmwzMi04MGgtOTZ6Ii8+PC9zdmc+";
     return `{
@@ -470,16 +403,16 @@ export default {
       "short_name": "记账",
       "description": "极简高效的个人记账应用",
       "start_url": "/",
-      "scope": "/", // 优化: 添加 Scope
+      "scope": "/",
       "display": "standalone",
-      "display_override": ["window-controls-overlay", "standalone"], // 优化: 尝试更现代的显示模式
+      "display_override": ["window-controls-overlay", "standalone"],
       "background_color": "#0f172a",
       "theme_color": "#0f172a",
       "icons": [
         { "src": "\${iconBase64}", "sizes": "192x192", "type": "image/svg+xml" },
         { "src": "\${iconBase64}", "sizes": "512x512", "type": "image/svg+xml" }
       ],
-      "shortcuts": [ // 优化: 添加快捷方式
+      "shortcuts": [
           {
               "name": "记一笔",
               "short_name": "记账",
@@ -501,7 +434,6 @@ export default {
   function generateToken() { return Math.random().toString(36).substring(2) + Date.now().toString(36); }
   
   function calculateSummary(transactions, period = 'daily') {
-  // ... (calculateSummary 函数内容不变)
     let income = 0, expense = 0;
     const now = new Date();
     const BJT_OFFSET = 8 * 60 * 60 * 1000;
@@ -533,9 +465,7 @@ export default {
   }
   
   function getLoginPageHTML() {
-  // ... (getLoginPageHTML 函数内容不变)
     const iconBase64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgcng9IjEyOCIgZmlsbD0iIzBmMTcyYSIvPjxwYXRoIGZpbGw9IiNmZmYiIGQ9Ik0yNTYgMTI4bC0zMiA4MEgxMjhsODAgMzItODAgMzJoOTZsMzIgODBMMjU2IDQwMEwyODggMjU2aDk2bDMyLTgwaC05NnpNMjU2IDE5MmwzMiA4MGg5NmwzMi04MGgtOTZ6Ii8+PC9zdmc+";
-    
     return `<!DOCTYPE html>
   <html lang="zh-CN">
   <head>
@@ -547,12 +477,7 @@ export default {
       <link rel="apple-touch-icon" href="${iconBase64}">
       <style>
           @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&display=swap');
-          body {
-              margin: 0; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; min-height: 100vh;
-              display: flex; align-items: center; justify-content: center; background-color: #000;
-              background-image: radial-gradient(at 0% 0%, hsla(253,16%,7%,1) 0, transparent 50%), radial-gradient(at 50% 0%, hsla(225,39%,30%,1) 0, transparent 50%), radial-gradient(at 100% 0%, hsla(339,49%,30%,1) 0, transparent 50%);
-              color: white; overflow: hidden;
-          }
+          body { margin: 0; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; background-color: #000; background-image: radial-gradient(at 0% 0%, hsla(253,16%,7%,1) 0, transparent 50%), radial-gradient(at 50% 0%, hsla(225,39%,30%,1) 0, transparent 50%), radial-gradient(at 100% 0%, hsla(339,49%,30%,1) 0, transparent 50%); color: white; overflow: hidden; }
           .aurora { position: absolute; top: -50%; left: -50%; width: 200%; height: 200%; background: conic-gradient(from 0deg at 50% 50%, #1a2a6c 0deg, #b21f1f 120deg, #fdbb2d 240deg, #1a2a6c 360deg); filter: blur(80px); opacity: 0.3; animation: spin 20s linear infinite; z-index: -1; }
           @keyframes spin { 100% { transform: rotate(360deg); } }
           .card { background: rgba(255, 255, 255, 0.03); backdrop-filter: blur(24px); border: 1px solid rgba(255, 255, 255, 0.1); padding: 40px; border-radius: 32px; width: 90%; max-width: 360px; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.4); animation: float 6s ease-in-out infinite; }
@@ -596,7 +521,6 @@ export default {
   </html>`;
   }
   
-  // --- 优化后的 getHTML 函数 (PWA 注册和快捷方式处理) ---
   function getHTML() {
     const iconBase64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgcng9IjEyOCIgZmlsbD0iIzBmMTcyYSIvPjxwYXRoIGZpbGw9IiNmZmYiIGQ9Ik0yNTYgMTI4bC0zMiA4MEgxMjhsODAgMzItODAgMzJoOTZsMzIgODBMMjU2IDQwMEwyODggMjU2aDk2bDMyLTgwaC05NnpNMjU2IDE5MmwzMiA4MGg5NmwzMi04MGgtOTZ6Ii8+PC9zdmc+";
     
@@ -615,32 +539,16 @@ export default {
       <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
       
       <style>
-          :root {
-              --primary: #6366f1;
-              --primary-glow: rgba(99, 102, 241, 0.5);
-              --success: #10b981;
-              --danger: #f43f5e;
-              --bg: #0f172a;
-              --card-bg: rgba(30, 41, 59, 0.7);
-              --glass-border: rgba(255, 255, 255, 0.08);
-              --text: #f8fafc;
-              --text-muted: #94a3b8;
-          }
+          :root { --primary: #6366f1; --primary-glow: rgba(99, 102, 241, 0.5); --success: #10b981; --danger: #f43f5e; --bg: #0f172a; --card-bg: rgba(30, 41, 59, 0.7); --glass-border: rgba(255, 255, 255, 0.08); --text: #f8fafc; --text-muted: #94a3b8; }
           * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-          body {
-              margin: 0; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; background-color: var(--bg); color: var(--text); min-height: 100vh; padding-bottom: 40px;
-              background-image: radial-gradient(at 0% 0%, hsla(253,16%,7%,1) 0, transparent 50%), radial-gradient(at 50% 0%, hsla(225,39%,30%,1) 0, transparent 50%), radial-gradient(at 100% 0%, hsla(339,49%,30%,1) 0, transparent 50%);
-              background-attachment: fixed;
-          }
+          body { margin: 0; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; background-color: var(--bg); color: var(--text); min-height: 100vh; padding-bottom: 40px; background-image: radial-gradient(at 0% 0%, hsla(253,16%,7%,1) 0, transparent 50%), radial-gradient(at 50% 0%, hsla(225,39%,30%,1) 0, transparent 50%), radial-gradient(at 100% 0%, hsla(339,49%,30%,1) 0, transparent 50%); background-attachment: fixed; }
           .glow-spot { position: fixed; width: 300px; height: 300px; background: var(--primary); filter: blur(100px); opacity: 0.15; border-radius: 50%; z-index: -1; pointer-events: none; animation: moveSpot 10s infinite alternate; }
           @keyframes moveSpot { from { transform: translate(0,0); } to { transform: translate(50px, 50px); } }
-  
           .container { max-width: 600px; margin: 0 auto; padding: 20px 20px 80px 20px; }
           header { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; margin-bottom: 20px; }
           .brand { font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
           .logout-btn { background: rgba(255,255,255,0.1); border: 1px solid var(--glass-border); color: var(--text-muted); padding: 8px 16px; border-radius: 20px; font-size: 12px; cursor: pointer; transition: 0.3s; }
           .logout-btn:hover { background: rgba(255,255,255,0.2); color: white; }
-  
           .summary-card { background: linear-gradient(135deg, rgba(99,102,241,0.1) 0%, rgba(168,85,247,0.1) 100%); backdrop-filter: blur(20px); border-radius: 28px; padding: 30px; border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 20px 40px -10px rgba(0,0,0,0.3); margin-bottom: 30px; position: relative; overflow: hidden; }
           .summary-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.5), transparent); }
           .balance-label { font-size: 13px; color: var(--text-muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
@@ -655,8 +563,6 @@ export default {
           .stat-val { font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 600; }
           .income-val { color: var(--success); }
           .expense-val { color: var(--danger); }
-  
-          /* Input Area */
           .input-area { position: fixed; bottom: -100%; left: 0; right: 0; max-width: 600px; margin: 0 auto; border-top-left-radius: 32px; border-top-right-radius: 32px; padding: 24px; background: var(--card-bg); backdrop-filter: blur(20px); border: 1px solid var(--glass-border); border-bottom: none; box-shadow: 0 -10px 30px rgba(0,0,0,0.5); z-index: 1000; transition: bottom 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
           .input-area.active { bottom: 0; }
           .input-header { font-size: 18px; font-weight: 700; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
@@ -672,26 +578,9 @@ export default {
           input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
           .submit-btn { width: 100%; padding: 16px; background: white; color: black; border: none; border-radius: 16px; font-size: 16px; font-weight: 700; cursor: pointer; margin-top: 8px; transition: transform 0.2s; }
           .submit-btn:active { transform: scale(0.98); }
-  
-          /* Custom Alert Modal */
-          .modal-overlay {
-              position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-              background: rgba(0,0,0,0.6); backdrop-filter: blur(5px);
-              z-index: 2000;
-              display: flex; align-items: center; justify-content: center;
-              opacity: 0; pointer-events: none; transition: opacity 0.3s ease;
-          }
+          .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(5px); z-index: 2000; display: flex; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity 0.3s ease; }
           .modal-overlay.active { opacity: 1; pointer-events: auto; }
-          .modal-card {
-              background: var(--card-bg);
-              border: 1px solid var(--glass-border);
-              border-radius: 24px;
-              padding: 30px;
-              width: 85%; max-width: 320px;
-              text-align: center;
-              box-shadow: 0 20px 40px rgba(0,0,0,0.4);
-              transform: scale(0.9); transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-          }
+          .modal-card { background: var(--card-bg); border: 1px solid var(--glass-border); border-radius: 24px; padding: 30px; width: 85%; max-width: 320px; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.4); transform: scale(0.9); transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
           .modal-overlay.active .modal-card { transform: scale(1); }
           .modal-icon { font-size: 40px; margin-bottom: 16px; }
           .modal-title { font-size: 18px; font-weight: 700; margin-bottom: 8px; color: white; }
@@ -701,7 +590,6 @@ export default {
           .modal-btn.cancel { background: rgba(255,255,255,0.1); color: var(--text); }
           .modal-btn.delete { background: var(--danger); color: white; }
           .modal-btn:active { transform: scale(0.95); opacity: 0.9; }
-  
           .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; max-width: 600px; margin: 0 auto; height: 70px; background: rgba(30, 41, 59, 0.9); backdrop-filter: blur(25px); border-top: 1px solid var(--glass-border); display: flex; justify-content: space-around; align-items: center; padding: 0 10px; z-index: 10; user-select: none; }
           .nav-item { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; padding: 0 10px; color: var(--text-muted); font-size: 11px; font-weight: 500; cursor: pointer; transition: color 0.3s; }
           .nav-item.active { color: white; font-weight: 700; }
@@ -709,7 +597,6 @@ export default {
           .nav-icon { font-size: 20px; margin-bottom: 2px; transition: color 0.3s; }
           .nav-item.add-btn { width: 50px; height: 50px; background: linear-gradient(135deg, var(--primary), #a855f7); border-radius: 50%; color: white; box-shadow: 0 4px 15px var(--primary-glow); transform: translateY(-15px); transition: transform 0.2s, box-shadow 0.2s; font-size: 30px; font-weight: 300; }
           .nav-item.add-btn:active { transform: translateY(-15px) scale(0.95); }
-  
           .list-header { font-size: 10px; color: var(--text-muted); margin-bottom: 12px; margin-left: 4px; } 
           .transaction-list { display: flex; flex-direction: column; gap: 12px; padding-bottom: 40px; }
           .list-group { margin-top: 16px; }
@@ -719,10 +606,8 @@ export default {
           .group-content { max-height: 1000px; transition: max-height 0.4s ease-out, opacity 0.4s ease; overflow: hidden; opacity: 1; display: flex; flex-direction: column; gap: 10px; }
           .list-group.collapsed .group-content { max-height: 0; opacity: 0; }
           .group-content > .t-item { margin-bottom: 0; }
-          
           .loading-indicator { position: fixed; top: 0; left: 0; right: 0; height: 3px; background: linear-gradient(90deg, transparent, var(--primary), transparent); transform: scaleX(0); transform-origin: left; transition: transform 0.3s ease-out; z-index: 10000; }
           .loading-indicator.active { transform: scaleX(1); }
-          
           .t-item { position: relative; background: var(--danger); border: 1px solid var(--glass-border); border-radius: 18px; display: flex; align-items: center; overflow: hidden; animation: slideIn 0.4s ease-out forwards; opacity: 0; transform: translateY(10px); touch-action: pan-y; min-height: 46px; }
           .t-content { flex: 1; display: flex; align-items: center; padding: 8px 20px; transition: transform 0.3s ease; background: var(--card-bg); width: 100%; }
           @keyframes slideIn { to { opacity: 1; transform: translateY(0); } }
@@ -732,15 +617,8 @@ export default {
           .t-meta { font-size: 10px; color: var(--text-muted); } 
           .t-amount { font-family: 'JetBrains Mono', monospace; font-weight: 600; font-size: 12px; text-align: right; margin-left: 4px; flex-shrink: 0; }
           .empty-state { text-align: center; padding: 40px; color: var(--text-muted); }
-  
-          /* Chart 样式 */
           #dailyChartContainer { margin-top: -15px; margin-bottom: 15px; }
-  
-          @media (max-width: 480px) {
-              .container { padding: 16px 16px 80px 16px; }
-              .balance-amount { font-size: 32px; }
-              .summary-card { padding: 24px; }
-          }
+          @media (max-width: 480px) { .container { padding: 16px 16px 80px 16px; } .balance-amount { font-size: 32px; } .summary-card { padding: 24px; } }
       </style>
   </head>
   <body>
@@ -821,143 +699,69 @@ export default {
       </div>
   
       <script>
-          let state = {
-              type: 'income', period: 'daily',
-              categories: {
-                  expense: ['餐饮 🍔', '购物 🛍️', '交通 🚗', '住房 🏠', '娱乐 🎮', '医疗 💊', '其他 📝'],
-                  income: ['工资 💰', '奖金 💎', '理财 📈', '兼职 💼', '红包 🧧', '其他 📝']
-              },
-              chartInstance: null 
-          };
+          let state = { type: 'income', period: 'daily', categories: { expense: ['餐饮 🍔', '购物 🛍️', '交通 🚗', '住房 🏠', '娱乐 🎮', '医疗 💊', '其他 📝'], income: ['工资 💰', '奖金 💎', '理财 📈', '兼职 💼', '红包 🧧', '其他 📝'] }, chartInstance: null };
           let pendingDelete = null; 
   
-          function toggleGroup(groupId) {
-              const group = document.getElementById(groupId);
-              if (group) { group.classList.toggle('collapsed'); hapticFeedback(); }
-          }
+          function toggleGroup(groupId) { const group = document.getElementById(groupId); if (group) { group.classList.toggle('collapsed'); hapticFeedback(); } }
           window.toggleGroup = toggleGroup;
   
           function init() {
               updateCategoryOptions(); loadData();
               if ('serviceWorker' in navigator) {
                   window.addEventListener('load', () => { 
-                      navigator.serviceWorker.register('/sw.js')
-                          .then(reg => {
-                              // 优化: 监听Service Worker的更新
-                              reg.addEventListener('updatefound', () => {
-                                  const newWorker = reg.installing;
-                                  newWorker.addEventListener('statechange', () => {
-                                      if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                                          // 提示用户新版本可用
-                                          showUpdateNotification();
-                                      }
-                                  });
-                              });
-                              // 确保在控制页面加载的Worker激活时通知用户
-                              if (reg.waiting) {
-                                  showUpdateNotification();
-                              }
-                          })
-                          .catch(err => console.log('SW fail', err)); 
+                      navigator.serviceWorker.register('/sw.js').then(reg => {
+                          reg.addEventListener('updatefound', () => {
+                              const newWorker = reg.installing;
+                              newWorker.addEventListener('statechange', () => { if (newWorker.state === 'installed' && navigator.serviceWorker.controller) showUpdateNotification(); });
+                          });
+                          if (reg.waiting) showUpdateNotification();
+                      }).catch(err => console.log('SW fail', err)); 
                   });
               }
-              // 优化: 处理 URL 快捷方式 (来自 manifest.json)
               handleUrlShortcuts();
           }
           
-          // 优化: 新增 SW 更新提示函数
-          function showUpdateNotification() {
-              // 在实际应用中，可以使用更美观的 Toast 或 Modal
-              if (confirm('🎉 新版本已下载，是否立即刷新以使用最新功能?')) {
-                  window.location.reload();
-              }
-          }
-          
-          // 优化: 新增 URL 快捷方式处理函数
+          function showUpdateNotification() { if (confirm('🎉 新版本已下载，是否立即刷新以使用最新功能?')) window.location.reload(); }
           function handleUrlShortcuts() {
               const urlParams = new URLSearchParams(window.location.search);
-              const add = urlParams.get('add');
-              const period = urlParams.get('period');
-  
-              if (add === 'true') {
-                  openAddModal();
-              } else if (period) {
-                  const navEl = document.getElementById(\`nav-\${period}\`);
-                  if (navEl) {
-                      setPeriod(period, navEl);
-                  }
-              }
-              
-              // 清除查询参数，防止刷新重复执行
-              if (add || period) {
-                   window.history.replaceState(null, null, window.location.pathname); 
-              }
+              const add = urlParams.get('add'); const period = urlParams.get('period');
+              if (add === 'true') openAddModal(); else if (period) { const navEl = document.getElementById(\`nav-\${period}\`); if (navEl) setPeriod(period, navEl); }
+              if (add || period) window.history.replaceState(null, null, window.location.pathname); 
           }
   
           function hapticFeedback() { if (window.navigator.vibrate) window.navigator.vibrate(50); }
-  
           function openAddModal() { document.getElementById('addModal').classList.add('active'); hapticFeedback(); }
           function closeAddModal() { document.getElementById('addModal').classList.remove('active'); }
-  
-          function openDeleteModal(id, element, content) {
-              pendingDelete = { id, element, content };
-              document.getElementById('deleteModal').classList.add('active');
-              hapticFeedback();
-          }
-  
-          function cancelDelete() {
-              document.getElementById('deleteModal').classList.remove('active');
-              if (pendingDelete && pendingDelete.content) {
-                  pendingDelete.content.style.transform = 'translateX(0)';
-              }
-              pendingDelete = null;
-          }
+          function openDeleteModal(id, element, content) { pendingDelete = { id, element, content }; document.getElementById('deleteModal').classList.add('active'); hapticFeedback(); }
+          function cancelDelete() { document.getElementById('deleteModal').classList.remove('active'); if (pendingDelete && pendingDelete.content) pendingDelete.content.style.transform = 'translateX(0)'; pendingDelete = null; }
   
           async function confirmDelete() {
               document.getElementById('deleteModal').classList.remove('active');
               if (!pendingDelete) return;
-  
               const { id, element, content } = pendingDelete;
-              
               content.style.transition = 'transform 0.4s ease-out';
               content.style.transform = 'translateX(-100%)';
               hapticFeedback();
   
-              await deleteItem(id);
+              // 关键修改: 使用 DELETE 返回的最新列表直接更新 UI
+              const res = await fetch('/api/transactions/' + id, { method: 'DELETE' });
+              const updatedList = await res.json();
               
-              await loadSummaryOnly();
+              renderList(updatedList);
+              loadSummaryOnly(); // 异步更新统计数据
               
-              // 重新加载图表数据（根据当前选中周期）
+              // 刷新图表
               if (state.period === 'weekly') await loadWeeklyChart(); 
               if (state.period === 'monthly') await loadDailyChart(); 
               if (state.period === 'yearly') await loadYearlyChart(); 
-  
-              element.style.transition = 'opacity 0.3s ease 0.1s, margin 0.3s ease 0.1s, height 0.3s ease 0.1s, padding 0.3s ease 0.1s';
-              element.style.opacity = '0';
-              element.style.height = '0';
-              element.style.margin = '0';
-              element.style.padding = '0';
-  
-              setTimeout(() => element.remove(), 400);
               
               pendingDelete = null;
           }
           window.cancelDelete = cancelDelete;
           window.confirmDelete = confirmDelete;
   
-          function setType(type) {
-              state.type = type;
-              document.getElementById('btnIncome').className = \`type-btn \${type === 'income' ? 'active income' : ''}\`;
-              document.getElementById('btnExpense').className = \`type-btn \${type === 'expense' ? 'active expense' : ''}\`;
-              updateCategoryOptions(); hapticFeedback();
-          }
-  
-          function updateCategoryOptions() {
-              const select = document.getElementById('category'); select.innerHTML = '';
-              state.categories[state.type].forEach(c => {
-                  const opt = document.createElement('option'); opt.value = c.split(' ')[0]; opt.textContent = c; select.appendChild(opt);
-              });
-          }
+          function setType(type) { state.type = type; document.getElementById('btnIncome').className = \`type-btn \${type === 'income' ? 'active income' : ''}\`; document.getElementById('btnExpense').className = \`type-btn \${type === 'expense' ? 'active expense' : ''}\`; updateCategoryOptions(); hapticFeedback(); }
+          function updateCategoryOptions() { const select = document.getElementById('category'); select.innerHTML = ''; state.categories[state.type].forEach(c => { const opt = document.createElement('option'); opt.value = c.split(' ')[0]; opt.textContent = c; select.appendChild(opt); }); }
   
           function setPeriod(period, el) {
               state.period = period;
@@ -965,23 +769,17 @@ export default {
               if (el) el.classList.add('active'); 
               loadData(); 
               
-              // 曲线图加载逻辑更新
               const chartContainer = document.getElementById('dailyChartContainer');
-              if (period === 'monthly') {
+              if (['monthly', 'yearly', 'weekly'].includes(period)) {
                   chartContainer.style.display = 'block';
-                  loadDailyChart(); // 加载每日曲线 (本月)
-              } else if (period === 'yearly') {
-                  chartContainer.style.display = 'block';
-                  loadYearlyChart(); // 加载每月曲线 (今年)
-              } else if (period === 'weekly') { 
-                  chartContainer.style.display = 'block';
-                  loadWeeklyChart(); // 加载每周曲线 (本周)
+                  if (period === 'monthly') loadDailyChart();
+                  if (period === 'yearly') loadYearlyChart();
+                  if (period === 'weekly') loadWeeklyChart();
               } else {
                   chartContainer.style.display = 'none';
                   if (state.chartInstance) state.chartInstance.destroy();
                   state.chartInstance = null;
               }
-              
               hapticFeedback();
           }
   
@@ -992,266 +790,66 @@ export default {
                   const transactions = await txRes.json(); const summary = await sumRes.json();
                   renderSummary(summary); renderList(transactions);
                   
-                  // 默认加载曲线图 (根据当前周期)
-                  if (state.period === 'monthly') {
-                      document.getElementById('dailyChartContainer').style.display = 'block';
-                      await loadDailyChart(); 
-                  } else if (state.period === 'yearly') {
-                      document.getElementById('dailyChartContainer').style.display = 'block';
-                      await loadYearlyChart(); 
-                  } else if (state.period === 'weekly') { 
-                      document.getElementById('dailyChartContainer').style.display = 'block';
-                      await loadWeeklyChart(); 
-                  } else {
-                      document.getElementById('dailyChartContainer').style.display = 'none';
-                  }
-  
+                  if (state.period === 'monthly') { document.getElementById('dailyChartContainer').style.display = 'block'; await loadDailyChart(); }
+                  else if (state.period === 'yearly') { document.getElementById('dailyChartContainer').style.display = 'block'; await loadYearlyChart(); }
+                  else if (state.period === 'weekly') { document.getElementById('dailyChartContainer').style.display = 'block'; await loadWeeklyChart(); }
+                  else { document.getElementById('dailyChartContainer').style.display = 'none'; }
               } catch (e) { document.getElementById('list').innerHTML = '<div class="empty-state" style="color: var(--danger)">⚠️ 数据加载失败</div>'; } 
               finally { setTimeout(() => indicator.classList.remove('active'), 300); }
           }
           
-          async function loadSummaryOnly() {
-              try { 
-                  const sumRes = await fetch('/api/summary?period=' + state.period); 
-                  const summary = await sumRes.json(); 
-                  renderSummary(summary); 
-              } catch (e) {}
-          }
+          async function loadSummaryOnly() { try { const sumRes = await fetch('/api/summary?period=' + state.period); const summary = await sumRes.json(); renderSummary(summary); } catch (e) {} }
           window.loadSummaryOnly = loadSummaryOnly;
           
-          // --- 每日净流量曲线逻辑 (本月) ---
           async function loadDailyChart() {
               if (state.period !== 'monthly') return;
-  
               const now = new Date();
-              const year = now.getFullYear();
-              const month = now.getMonth() + 1;
-  
               try {
-                  const res = await fetch(\`/api/daily_balance?year=\${year}&month=\${month}\`);
-                  const dailyData = await res.json();
-                  renderDailyChart(dailyData);
-              } catch (e) {
-                  console.error("加载每日净流量曲线失败", e);
-                  const container = document.getElementById('dailyChartContainer');
-                  container.innerHTML = '<div style="color:var(--text-muted);text-align:center;font-size:12px;">加载曲线失败</div>';
-              }
+                  const res = await fetch(\`/api/daily_balance?year=\${now.getFullYear()}&month=\${now.getMonth() + 1}\`);
+                  renderDailyChart(await res.json());
+              } catch (e) { console.error(e); }
           }
           window.loadDailyChart = loadDailyChart;
   
+          function renderDailyChart(data) { renderChart(data.map(d => d.day), data.map(d => d.balance), '日'); }
   
-          function renderDailyChart(data) {
-              const ctx = document.getElementById('dailyBalanceChart').getContext('2d');
-              
-              const labels = data.map(d => d.day);
-              const netFlows = data.map(d => d.balance);
+          async function loadYearlyChart() {
+              if (state.period !== 'yearly') return;
+              try { const res = await fetch(\`/api/monthly_balance?year=\${new Date().getFullYear()}\`); renderYearlyChart(await res.json()); } catch (e) { console.error(e); }
+          }
+          window.loadYearlyChart = loadYearlyChart;
+          
+          function renderYearlyChart(data) { renderChart(data.map(d => d.month + '月'), data.map(d => d.balance), ''); }
   
-              if (state.chartInstance) { state.chartInstance.destroy(); }
+          async function loadWeeklyChart() {
+              if (state.period !== 'weekly') return;
+              try { const res = await fetch(\`/api/weekly_balance\`); renderWeeklyChart(await res.json()); } catch (e) { console.error(e); }
+          }
+          window.loadWeeklyChart = loadWeeklyChart;
+          
+          function renderWeeklyChart(data) { renderChart(data.map(d => '周' + d.day), data.map(d => d.balance), ''); }
   
-              state.chartInstance = new Chart(ctx, {
+          function renderChart(labels, netFlows, suffix) {
+               const ctx = document.getElementById('dailyBalanceChart').getContext('2d');
+               if (state.chartInstance) { state.chartInstance.destroy(); }
+               state.chartInstance = new Chart(ctx, {
                   type: 'bar', 
                   data: {
                       labels: labels,
                       datasets: [{
-                          label: '每日净流量 (¥)',
-                          data: netFlows,
+                          label: '净流量', data: netFlows,
                           backgroundColor: netFlows.map(amount => amount >= 0 ? 'rgba(16, 185, 129, 0.8)' : 'rgba(244, 63, 94, 0.8)'),
                           borderColor: netFlows.map(amount => amount >= 0 ? 'var(--success)' : 'var(--danger)'),
-                          borderWidth: 1,
-                          borderRadius: 4,
+                          borderWidth: 1, borderRadius: 4,
                       }]
                   },
                   options: {
-                      responsive: true,
-                      maintainAspectRatio: false,
-                      plugins: {
-                          legend: { display: false },
-                          tooltip: { 
-                              mode: 'index', 
-                              intersect: false, 
-                              titleFont: { size: 14, weight: 'bold' },
-                              bodyFont: { size: 13 },
-                              callbacks: {
-                                  label: function(context) {
-                                      const value = context.parsed.y;
-                                      return (value >= 0 ? ' 净收入: ¥' : ' 净支出: ¥') + Math.abs(value).toFixed(2);
-                                  },
-                                  title: function(items) { return items[0].label + '日'; }
-                              },
-                          },
-                      },
-                      scales: {
-                          x: { 
-                              display: true, 
-                              title: { display: false },
-                              grid: { color: 'rgba(255,255,255,0.05)' },
-                              ticks: { color: 'var(--text-muted)' }
-                          },
-                          y: { 
-                              display: false, 
-                              title: { display: false },
-                              grid: { color: 'rgba(255,255,255,0.05)' }
-                          }
-                      },
+                      responsive: true, maintainAspectRatio: false,
+                      plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false, callbacks: { label: function(context) { const value = context.parsed.y; return (value >= 0 ? ' 净收入: ¥' : ' 净支出: ¥') + Math.abs(value).toFixed(2); }, title: function(items) { return items[0].label + suffix; } } } },
+                      scales: { x: { display: true, grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: 'var(--text-muted)' } }, y: { display: false, grid: { color: 'rgba(255,255,255,0.05)' } } },
                   }
               });
           }
-          
-          // --- 每月净流量曲线逻辑 (今年) ---
-          async function loadYearlyChart() {
-              if (state.period !== 'yearly') return;
-  
-              const year = new Date().getFullYear();
-  
-              try {
-                  const res = await fetch(\`/api/monthly_balance?year=\${year}\`);
-                  const monthlyData = await res.json();
-                  renderYearlyChart(monthlyData);
-              } catch (e) {
-                  console.error("加载每月净流量曲线失败", e);
-                  const container = document.getElementById('dailyChartContainer');
-                  container.innerHTML = '<div style="color:var(--text-muted);text-align:center;font-size:12px;">加载曲线失败</div>';
-              }
-          }
-          window.loadYearlyChart = loadYearlyChart;
-  
-          function renderYearlyChart(data) {
-              const ctx = document.getElementById('dailyBalanceChart').getContext('2d');
-              
-              // 提取标签和数据 (现在是每月净流量)
-              const labels = data.map(d => d.month + '月');
-              const netFlows = data.map(d => d.balance);
-  
-              if (state.chartInstance) { state.chartInstance.destroy(); }
-  
-              state.chartInstance = new Chart(ctx, {
-                  type: 'bar', // 柱状图 (Bar Chart)
-                  data: {
-                      labels: labels,
-                      datasets: [{
-                          label: '每月净流量 (¥)',
-                          data: netFlows,
-                          // 根据金额正负设置颜色
-                          backgroundColor: netFlows.map(amount => amount >= 0 ? 'rgba(16, 185, 129, 0.8)' : 'rgba(244, 63, 94, 0.8)'),
-                          borderColor: netFlows.map(amount => amount >= 0 ? 'var(--success)' : 'var(--danger)'),
-                          borderWidth: 1,
-                          borderRadius: 4,
-                      }]
-                  },
-                  options: {
-                      responsive: true,
-                      maintainAspectRatio: false,
-                      plugins: {
-                          legend: { display: false },
-                          tooltip: { 
-                              mode: 'index', 
-                              intersect: false, 
-                              titleFont: { size: 14, weight: 'bold' },
-                              bodyFont: { size: 13 },
-                              callbacks: {
-                                  // 更新工具提示信息
-                                  label: function(context) {
-                                      const value = context.parsed.y;
-                                      return (value >= 0 ? ' 净收入: ¥' : ' 净支出: ¥') + Math.abs(value).toFixed(2);
-                                  },
-                                  title: function(items) { return items[0].label; }
-                              },
-                          },
-                      },
-                      scales: {
-                          x: { 
-                              display: true, 
-                              title: { display: false },
-                              grid: { color: 'rgba(255,255,255,0.05)' },
-                              ticks: { color: 'var(--text-muted)' }
-                          },
-                          y: { 
-                              display: false, // 隐藏 Y 轴刻度，保持简洁
-                              title: { display: false },
-                              grid: { color: 'rgba(255,255,255,0.05)' }
-                          }
-                      },
-                  }
-              });
-          }
-          
-          // --- 🎯 新增：加载每周净流量曲线逻辑 (本周) ---
-          async function loadWeeklyChart() {
-              if (state.period !== 'weekly') return;
-  
-              try {
-                  // 调用新的 API 路由
-                  const res = await fetch(\`/api/weekly_balance\`);
-                  const weeklyData = await res.json();
-                  renderWeeklyChart(weeklyData);
-              } catch (e) {
-                  console.error("加载每周净流量曲线失败", e);
-                  const container = document.getElementById('dailyChartContainer');
-                  container.innerHTML = '<div style="color:var(--text-muted);text-align:center;font-size:12px;">加载曲线失败</div>';
-              }
-          }
-          window.loadWeeklyChart = loadWeeklyChart;
-  
-          function renderWeeklyChart(data) {
-              const ctx = document.getElementById('dailyBalanceChart').getContext('2d');
-              
-              // 提取标签和数据 (周一到周日)
-              const labels = data.map(d => '周' + d.day);
-              const netFlows = data.map(d => d.balance);
-  
-              if (state.chartInstance) { state.chartInstance.destroy(); }
-  
-              state.chartInstance = new Chart(ctx, {
-                  type: 'bar', // 柱状图 (Bar Chart)
-                  data: {
-                      labels: labels,
-                      datasets: [{
-                          label: '每日净流量 (¥)',
-                          data: netFlows,
-                          // 根据金额正负设置颜色
-                          backgroundColor: netFlows.map(amount => amount >= 0 ? 'rgba(16, 185, 129, 0.8)' : 'rgba(244, 63, 94, 0.8)'),
-                          borderColor: netFlows.map(amount => amount >= 0 ? 'var(--success)' : 'var(--danger)'),
-                          borderWidth: 1,
-                          borderRadius: 4,
-                      }]
-                  },
-                  options: {
-                      responsive: true,
-                      maintainAspectRatio: false,
-                      plugins: {
-                          legend: { display: false },
-                          tooltip: { 
-                              mode: 'index', 
-                              intersect: false, 
-                              titleFont: { size: 14, weight: 'bold' },
-                              bodyFont: { size: 13 },
-                              callbacks: {
-                                  // 更新工具提示信息
-                                  label: function(context) {
-                                      const value = context.parsed.y;
-                                      return (value >= 0 ? ' 净收入: ¥' : ' 净支出: ¥') + Math.abs(value).toFixed(2);
-                                  },
-                                  title: function(items) { return items[0].label; }
-                              },
-                          },
-                      },
-                      scales: {
-                          x: { 
-                              display: true, 
-                              title: { display: false },
-                              grid: { color: 'rgba(255,255,255,0.05)' },
-                              ticks: { color: 'var(--text-muted)' }
-                          },
-                          y: { 
-                              display: false, // 隐藏 Y 轴刻度，保持简洁
-                              title: { display: false },
-                              grid: { color: 'rgba(255,255,255,0.05)' }
-                          }
-                      },
-                  }
-              });
-          }
-          // --- 结束：周图表逻辑修改 ---
   
           function renderSummary(data) {
               const balEl = document.getElementById('balanceDisplay');
@@ -1265,26 +863,14 @@ export default {
   
           function animateValue(obj, start, end) {
               let startTimestamp = null; const duration = 500;
-              const step = (timestamp) => {
-                  if (!startTimestamp) startTimestamp = timestamp;
-                  const progress = Math.min((timestamp - startTimestamp) / duration, 1);
-                  obj.innerHTML = '¥' + (start + progress * (end - start)).toFixed(2);
-                  if (progress < 1) window.requestAnimationFrame(step);
-              }; window.requestAnimationFrame(step);
+              const step = (timestamp) => { if (!startTimestamp) startTimestamp = timestamp; const progress = Math.min((timestamp - startTimestamp) / duration, 1); obj.innerHTML = '¥' + (start + progress * (end - start)).toFixed(2); if (progress < 1) window.requestAnimationFrame(step); }; window.requestAnimationFrame(step);
           }
   
           function renderList(list) {
               const container = document.getElementById('list');
               if (list.length === 0) { container.innerHTML = '<div class="empty-state">🍃 暂无数据，开始记账吧</div>'; return; }
               const getIcon = (cat) => { const map = {'餐饮':'🍔','购物':'🛍️','交通':'🚗','住房':'🏠','娱乐':'🎮','医疗':'💊','工资':'💰','奖金':'💎','理财':'📈','兼职':'💼','红包':'🧧','其他':'📝','默认':'📝'}; return map[cat] || '📝'; };
-              const getFormattedDate = (isoDate) => {
-                  const d = new Date(isoDate); const date = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-                  const now = new Date(); const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-                  const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
-                  if (date.getTime() === today.getTime()) return '今天';
-                  if (date.getTime() === yesterday.getTime()) return '昨天';
-                  return date.toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'short' });
-              };
+              const getFormattedDate = (isoDate) => { const d = new Date(isoDate); const date = new Date(d.getFullYear(), d.getMonth(), d.getDate()); const now = new Date(); const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()); const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1); if (date.getTime() === today.getTime()) return '今天'; if (date.getTime() === yesterday.getTime()) return '昨天'; return date.toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'short' }); };
               const sortedList = list.sort((a,b) => new Date(b.timestamp) - new Date(a.timestamp));
               const groupedList = sortedList.reduce((groups, item) => { const dateKey = item.timestamp.substring(0, 10); if (!groups[dateKey]) groups[dateKey] = []; groups[dateKey].push(item); return groups; }, {});
   
@@ -1292,39 +878,22 @@ export default {
               for (const dateKey in groupedList) {
                   const items = groupedList[dateKey]; const groupId = \`group-\${dateKey}\`;
                   const isCollapsed = (new Date(new Date().toDateString()).getTime() - new Date(dateKey).getTime()) / 86400000 > 3;
-                  html += \`<div class="list-group \${isCollapsed ? 'collapsed' : ''}" id="\${groupId}">
-                              <div class="list-date-header" onclick="toggleGroup('\${groupId}')"><span>\${getFormattedDate(dateKey)}</span><span class="collapse-icon">▼</span></div>
-                              <div class="group-content">\${items.map(t => { indexCounter++; return \`<div class="t-item" data-id="\${t.id}" style="animation-delay: \${indexCounter * 0.05}s"><div class="t-content"><div class="t-icon">\${getIcon(t.category)}</div><div class="t-details"><div class="t-title">\${t.description || t.category}</div><div class="t-meta">\${new Date(t.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · \${t.category}</div></div><div class="t-amount" style="color: \${t.type === 'income' ? 'var(--success)' : 'var(--danger)'}">\${t.type === 'income' ? '+' : '-'} \${parseFloat(t.amount).toFixed(2)}</div></div></div>\`; }).join('')}</div></div>\`;
+                  html += \`<div class="list-group \${isCollapsed ? 'collapsed' : ''}" id="\${groupId}"><div class="list-date-header" onclick="toggleGroup('\${groupId}')"><span>\${getFormattedDate(dateKey)}</span><span class="collapse-icon">▼</span></div><div class="group-content">\${items.map(t => { indexCounter++; return \`<div class="t-item" data-id="\${t.id}" style="animation-delay: \${indexCounter * 0.05}s"><div class="t-content"><div class="t-icon">\${getIcon(t.category)}</div><div class="t-details"><div class="t-title">\${t.description || t.category}</div><div class="t-meta">\${new Date(t.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · \${t.category}</div></div><div class="t-amount" style="color: \${t.type === 'income' ? 'var(--success)' : 'var(--danger)'}">\${t.type === 'income' ? '+' : '-'} \${parseFloat(t.amount).toFixed(2)}</div></div></div>\`; }).join('')}</div></div>\`;
               }
               container.innerHTML = html;
-  
               container.querySelectorAll('.t-item').forEach(item => {
-                  const content = item.querySelector('.t-content');
-                  let startX = 0; let isDragging = false; let itemMoved = false;
+                  const content = item.querySelector('.t-content'); let startX = 0; let isDragging = false; let itemMoved = false;
                   item.addEventListener('touchstart', (e) => { startX = e.touches[0].clientX; isDragging = false; content.style.transition = 'none'; container.querySelectorAll('.t-content').forEach(c => { if (c !== content) c.style.transform = 'translateX(0)'; }); }, { passive: true });
-                  item.addEventListener('touchmove', (e) => {
-                      const diff = e.touches[0].clientX - startX;
-                      if (Math.abs(diff) > 5) isDragging = true;
-                      if (diff < 0) { content.style.transform = \`translateX(\${diff}px)\`; itemMoved = true; } 
-                      else if ((parseInt(content.style.transform.replace('translateX(', '')) || 0) < 0) { content.style.transform = \`translateX(\${diff}px)\`; itemMoved = true; }
-                      if(isDragging) e.preventDefault();
-                  }, { passive: false });
-                  item.addEventListener('touchend', async (e) => {
-                      content.style.transition = 'transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275)';
-                      const deleteThreshold = -item.offsetWidth * 0.4;
-                      const currentOffset = parseInt(content.style.transform.replace('translateX(', '')) || 0;
-                      if (currentOffset < deleteThreshold) {
-                          openDeleteModal(item.dataset.id, item, content);
-                      } else { content.style.transform = 'translateX(0)'; }
-                      if (itemMoved) e.stopPropagation(); itemMoved = false;
-                  });
+                  item.addEventListener('touchmove', (e) => { const diff = e.touches[0].clientX - startX; if (Math.abs(diff) > 5) isDragging = true; if (diff < 0) { content.style.transform = \`translateX(\${diff}px)\`; itemMoved = true; } else if ((parseInt(content.style.transform.replace('translateX(', '')) || 0) < 0) { content.style.transform = \`translateX(\${diff}px)\`; itemMoved = true; } if(isDragging) e.preventDefault(); }, { passive: false });
+                  item.addEventListener('touchend', async (e) => { content.style.transition = 'transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275)'; const deleteThreshold = -item.offsetWidth * 0.4; const currentOffset = parseInt(content.style.transform.replace('translateX(', '')) || 0; if (currentOffset < deleteThreshold) { openDeleteModal(item.dataset.id, item, content); } else { content.style.transform = 'translateX(0)'; } if (itemMoved) e.stopPropagation(); itemMoved = false; });
               });
           }
   
           document.getElementById('addForm').onsubmit = async (e) => {
               e.preventDefault(); const btn = e.target.querySelector('button'); btn.disabled = true; btn.innerText = '保存中...'; hapticFeedback();
               try { 
-                  await fetch('/api/transactions', { 
+                  // 关键修改: 接收 API 返回的最新列表数据
+                  const res = await fetch('/api/transactions', { 
                       method: 'POST', 
                       headers: {'Content-Type': 'application/json'}, 
                       body: JSON.stringify({ 
@@ -1334,16 +903,29 @@ export default {
                           description: document.getElementById('desc').value 
                       }) 
                   }); 
+                  
+                  // 直接使用返回的 updatedList 渲染，无需再次 fetch GET
+                  const updatedList = await res.json();
                   document.getElementById('amount').value = ''; 
                   document.getElementById('desc').value = ''; 
                   closeAddModal(); 
-                  await loadData();
+                  
+                  renderList(updatedList);
+                  loadSummaryOnly(); // 异步更新统计数据
+                  
+                  // 根据周期刷新图表
+                  if (state.period === 'monthly') await loadDailyChart(); 
+                  else if (state.period === 'weekly') await loadWeeklyChart();
+                  
               } 
-              catch(e) { alert('保存失败'); } 
+              catch(e) { console.error(e); alert('保存失败'); } 
               finally { btn.disabled = false; btn.innerText = '确认添加'; }
           };
   
-          async function deleteItem(id) { await fetch('/api/transactions/' + id, { method: 'DELETE' }); }
+          async function deleteItem(id) { 
+              // 注意: 此函数目前在 UI 中未直接使用，实际逻辑在 confirmDelete 中
+              await fetch('/api/transactions/' + id, { method: 'DELETE' }); 
+          }
           function logout() { fetch('/api/auth/logout', {method:'POST'}).then(() => window.location.href = '/login'); }
           init();
       </script>
