@@ -155,6 +155,37 @@ async function handleAPIRequest(request, env, path, method) {
     return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
   }
 
+  // --- API: 获取每月每日净流量曲线数据 (本月) ---
+  if (path === '/api/daily_balance') {
+      const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
+      const url = new URL(request.url);
+      
+      const targetYear = parseInt(url.searchParams.get('year') || new Date().getFullYear());
+      const targetMonth = parseInt(url.searchParams.get('month') || new Date().getMonth() + 1);
+
+      const dailyBalances = calculateDailyBalances(transactions, targetYear, targetMonth);
+      return new Response(JSON.stringify(dailyBalances), { headers: { 'Content-Type': 'application/json' } });
+  }
+  
+  // --- API: 获取每年每月净流量曲线数据 (今年) ---
+  if (path === '/api/monthly_balance') {
+    const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
+    const url = new URL(request.url);
+    
+    const targetYear = parseInt(url.searchParams.get('year') || new Date().getFullYear());
+
+    const monthlyBalances = calculateMonthlyNetFlow(transactions, targetYear);
+    return new Response(JSON.stringify(monthlyBalances), { headers: { 'Content-Type': 'application/json' } });
+  }
+  
+  // --- 🎯 新增 API: 获取每周每日净流量曲线数据 (本周) ---
+  if (path === '/api/weekly_balance') {
+    const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
+    // 不需要额外的参数，因为始终是“本周”
+    const weeklyBalances = calculateWeeklyNetFlow(transactions);
+    return new Response(JSON.stringify(weeklyBalances), { headers: { 'Content-Type': 'application/json' } });
+  }
+
   if (path === '/api/summary') {
     const url = new URL(request.url);
     const period = url.searchParams.get('period') || 'daily';
@@ -166,11 +197,195 @@ async function handleAPIRequest(request, env, path, method) {
   return new Response('Not Found', { status: 404 });
 }
 
+// --- 每日净流量 (Daily Net Flow - 本月) 逻辑 (保持不变) ---
+function calculateDailyBalances(transactions, targetYear, targetMonth) {
+    const monthlyTransactions = transactions.filter(t => {
+        const d = new Date(t.timestamp);
+        return d.getFullYear() === targetYear && d.getMonth() === targetMonth - 1; 
+    }).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    // 获取当前日期 (BJT/KST 逻辑: UTC + 8小时)
+    const now = new Date();
+    const BJT_OFFSET = 8 * 60 * 60 * 1000;
+    const utcNowMs = now.getTime();
+    const BJT_Date = new Date(utcNowMs + BJT_OFFSET);
+    
+    // 如果请求的月份和年份是未来，则不返回数据
+    if (targetYear > BJT_Date.getUTCFullYear() || (targetYear === BJT_Date.getUTCFullYear() && targetMonth > BJT_Date.getUTCMonth() + 1)) {
+        return [];
+    }
+
+    const daysInMonth = new Date(targetYear, targetMonth, 0).getDate();
+    const dailyData = [];
+    const maxDay = daysInMonth; 
+
+    // 1. 预计算每天的净流量
+    const dailyNetFlows = {};
+    monthlyTransactions.forEach(t => {
+        const d = new Date(t.timestamp);
+        const day = d.getDate();
+        const amount = parseFloat(t.amount);
+        const netAmount = t.type === 'income' ? amount : -amount;
+        
+        dailyNetFlows[day] = (dailyNetFlows[day] || 0) + netAmount;
+    });
+
+    // 2. 填充整个月的数据，并处理未来日期
+    for (let day = 1; day <= maxDay; day++) {
+        const dateKey = `${targetYear}-${String(targetMonth).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        
+        let dailyAmount = dailyNetFlows[day] || 0;
+        
+        // 核心逻辑：未来日期的金额设置为 0
+        if (targetYear === BJT_Date.getUTCFullYear() && targetMonth === BJT_Date.getUTCMonth() + 1) {
+            if (day > BJT_Date.getUTCDate()) {
+                dailyAmount = 0; // 未来日期，金额为 0
+            }
+        }
+        
+        dailyData.push({
+            day: day,
+            date: dateKey,
+            balance: dailyAmount, // 'balance' 字段现在存储的是每日净流量
+        });
+    }
+
+    return dailyData;
+}
+
+
+// --- 每月净流量 (Monthly Net Flow - 今年) 逻辑 (保持不变) ---
+function calculateMonthlyNetFlow(transactions, targetYear) {
+    // 获取当前日期 (BJT/KST 逻辑: UTC + 8小时)
+    const now = new Date();
+    const BJT_OFFSET = 8 * 60 * 60 * 1000;
+    const utcNowMs = now.getTime();
+    const BJT_Date = new Date(utcNowMs + BJT_OFFSET);
+
+    const currentYear = BJT_Date.getUTCFullYear();
+    const currentMonth = BJT_Date.getUTCMonth() + 1; // 1-12
+
+    // 如果请求的年份是未来，则不返回数据
+    if (targetYear > currentYear) {
+        return [];
+    }
+
+    // 1. 预计算每月的净流量
+    const monthlyNetFlows = {};
+    transactions.forEach(t => {
+        const d = new Date(t.timestamp);
+        const year = d.getFullYear();
+        const month = d.getMonth() + 1; // 1-12
+        
+        if (year === targetYear) {
+            const amount = parseFloat(t.amount);
+            // 净流量 = 收入金额 - 支出金额
+            const netAmount = t.type === 'income' ? amount : -amount;
+            
+            monthlyNetFlows[month] = (monthlyNetFlows[month] || 0) + netAmount;
+        }
+    });
+
+    const monthlyData = [];
+
+    // 2. 填充 1 月到 12 月的数据，并处理未来月份
+    for (let month = 1; month <= 12; month++) {
+        let monthlyAmount = monthlyNetFlows[month] || 0;
+        
+        // --- 核心逻辑：未来月份的金额设置为 0 ---
+        if (targetYear === currentYear) {
+            if (month > currentMonth) {
+                monthlyAmount = 0; // 未来月份，金额为 0
+            }
+        }
+        
+        monthlyData.push({
+            month: month,
+            balance: monthlyAmount, // 'balance' 字段现在存储的是每月净流量
+        });
+    }
+
+    return monthlyData;
+}
+
+
+// --- 🎯 新增核心逻辑: 计算每周每日净流量 (Weekly Net Flow - 本周) ---
+function calculateWeeklyNetFlow(transactions) {
+    // 获取当前日期 (BJT/KST 逻辑: UTC + 8小时)
+    const now = new Date();
+    const BJT_OFFSET = 8 * 60 * 60 * 1000;
+    const utcNowMs = now.getTime();
+    const BJT_Date = new Date(utcNowMs + BJT_OFFSET);
+
+    // 计算本周的起始日期 (周一)
+    // getUTCDay() 返回 0 (周日) - 6 (周六)
+    let dayOfWeek = BJT_Date.getUTCDay(); 
+    // 周日 (0) 偏移 -6；周一 (1) 偏移 0；周二 (2) 偏移 -1；...
+    let mondayOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek; 
+    
+    // 设置到本周的周一的 UTC 日期
+    const startOfWeek = new Date(Date.UTC(BJT_Date.getUTCFullYear(), BJT_Date.getUTCMonth(), BJT_Date.getUTCDate() + mondayOffset));
+    
+    // 格式化日期为 YYYY-MM-DD，用于比较
+    const formatDate = (d) => d.toISOString().substring(0, 10);
+    const todayKey = formatDate(BJT_Date);
+    
+    // 1. 初始化数据点
+    const dayLabels = ['一', '二', '三', '四', '五', '六', '日'];
+    const dataPoints = [];
+
+    for (let i = 0; i < 7; i++) {
+        const date = new Date(startOfWeek);
+        date.setUTCDate(startOfWeek.getUTCDate() + i);
+        dataPoints.push({
+            day: dayLabels[i],
+            date: date,
+            balance: 0,
+            dateKey: formatDate(date)
+        });
+    }
+
+    // 2. 累加交易
+    const dailyNetFlows = {};
+    const weekStartKey = dataPoints[0].dateKey;
+    const weekEndKey = dataPoints[6].dateKey;
+
+    transactions.forEach(t => {
+        const d = new Date(t.timestamp);
+        const transactionDateKey = formatDate(d);
+        
+        // 过滤本周的交易
+        if (transactionDateKey >= weekStartKey && transactionDateKey <= weekEndKey) {
+            const amount = parseFloat(t.amount);
+            const netAmount = t.type === 'income' ? amount : -amount;
+            
+            dailyNetFlows[transactionDateKey] = (dailyNetFlows[transactionDateKey] || 0) + netAmount;
+        }
+    });
+
+    // 3. 填充数据并应用未来逻辑
+    return dataPoints.map(dataPoint => {
+        let dailyAmount = dailyNetFlows[dataPoint.dateKey] || 0;
+        
+        // 核心逻辑：未来日期的金额设置为 0
+        if (dataPoint.dateKey > todayKey) {
+            dailyAmount = 0; // 未来日期，金额为 0
+        }
+        
+        return {
+            day: dataPoint.day, // 周一, 周二...
+            balance: dailyAmount
+        };
+    });
+}
+
+
 function getServiceWorker() {
+// ... (getServiceWorker 函数内容不变)
   return `
 const CACHE_NAME = 'accounting-app-v7'; 
 const urlsToCache = ['/', '/manifest.json'];
-self.addEventListener('install', e => e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(urlsToCache))));
+self.addEventListener('install', e => e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(urlsToCache)));
 self.addEventListener('fetch', e => {
   e.respondWith(caches.match(e.request).then(r => r || fetch(e.request)));
 });
@@ -180,6 +395,7 @@ self.addEventListener('activate', e => {
 }
 
 function getManifest() {
+// ... (getManifest 函数内容不变)
   const iconBase64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgcng9IjEyOCIgZmlsbD0iIzBmMTcyYSIvPjxwYXRoIGZpbGw9IiNmZmYiIGQ9Ik0yNTYgMTI4bC0zMiA4MEgxMjhsODAgMzItODAgMzJoOTZsMzIgODBMMjU2IDQwMEwyODggMjU2aDk2bDMyLTgwaC05NnpNMjU2IDE5MmwzMiA4MGg5NmwzMi04MGgtOTZ6Ii8+PC9zdmc+";
   return `{
     "name": "极光记账",
@@ -199,6 +415,7 @@ function getManifest() {
 function generateToken() { return Math.random().toString(36).substring(2) + Date.now().toString(36); }
 
 function calculateSummary(transactions, period = 'daily') {
+// ... (calculateSummary 函数内容不变)
   let income = 0, expense = 0;
   const now = new Date();
   const BJT_OFFSET = 8 * 60 * 60 * 1000;
@@ -230,6 +447,7 @@ function calculateSummary(transactions, period = 'daily') {
 }
 
 function getLoginPageHTML() {
+// ... (getLoginPageHTML 函数内容不变)
   const iconBase64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgcng9IjEyOCIgZmlsbD0iIzBmMTcyYSIvPjxwYXRoIGZpbGw9IiNmZmYiIGQ9Ik0yNTYgMTI4bC0zMiA4MEgxMjhsODAgMzItODAgMzJoOTZsMzIgODBMMjU2IDQwMEwyODggMjU2aDk2bDMyLTgwaC05NnpNMjU2IDE5MmwzMiA4MGg5NmwzMi04MGgtOTZ6Ii8+PC9zdmc+";
   
   return `<!DOCTYPE html>
@@ -294,6 +512,7 @@ function getLoginPageHTML() {
 
 // --- 极致美化版 主页面 ---
 function getHTML() {
+// ... (HTML 结构不变)
   const iconBase64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgcng9IjEyOCIgZmlsbD0iIzBmMTcyYSIvPjxwYXRoIGZpbGw9IiNmZmYiIGQ9Ik0yNTYgMTI4bC0zMiA4MEgxMjhsODAgMzItODAgMzJoOTZsMzIgODBMMjU2IDQwMEwyODggMjU2aDk2bDMyLTgwaC05NnpNMjU2IDE5MmwzMiA4MGg5NmwzMi04MGgtOTZ6Ii8+PC9zdmc+";
   
   return `<!DOCTYPE html>
@@ -308,6 +527,7 @@ function getHTML() {
     <link rel="manifest" href="/manifest.json">
     <link rel="apple-touch-icon" href="${iconBase64}">
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     
     <style>
         :root {
@@ -428,6 +648,9 @@ function getHTML() {
         .t-amount { font-family: 'JetBrains Mono', monospace; font-weight: 600; font-size: 12px; text-align: right; margin-left: 4px; flex-shrink: 0; }
         .empty-state { text-align: center; padding: 40px; color: var(--text-muted); }
 
+        /* Chart 样式 */
+        #dailyChartContainer { margin-top: -15px; margin-bottom: 15px; }
+
         @media (max-width: 480px) {
             .container { padding: 16px 16px 80px 16px; }
             .balance-amount { font-size: 32px; }
@@ -447,8 +670,13 @@ function getHTML() {
         </header>
 
         <div class="summary-card">
-            <div class="balance-label">当前结余 (Balance)</div>
+            <div class="balance-label">当前结余</div>
             <div class="balance-amount" id="balanceDisplay">¥0.00</div>
+            
+            <div id="dailyChartContainer">
+                <canvas id="dailyBalanceChart"></canvas>
+            </div>
+            
             <div class="progress-bar">
                 <div class="bar-income" id="barIncome" style="width: 50%"></div>
                 <div class="bar-expense" id="barExpense" style="width: 50%"></div>
@@ -465,7 +693,7 @@ function getHTML() {
             </div>
         </div>
 
-        <div class="list-header">近期明细 · RECENT</div>
+        <div class="list-header">近期明细</div>
         <div id="list" class="transaction-list">
             <div class="empty-state">加载中...</div>
         </div>
@@ -504,7 +732,7 @@ function getHTML() {
         <div class="nav-item" id="nav-weekly" onclick="setPeriod('weekly', this)"><div class="nav-icon">🗓️</div>本周</div>
         <div class="nav-item add-btn" onclick="openAddModal()"><div class="nav-icon">+</div></div>
         <div class="nav-item" id="nav-monthly" onclick="setPeriod('monthly', this)"><div class="nav-icon">📊</div>本月</div>
-        <div class="nav-item" id="nav-yearly" onclick="setPeriod('yearly', this)"><div class="nav-icon">⭐</div>今年</div>
+        <div class="nav-item" id="nav-yearly" onclick="setPeriod('yearly', this)"><div class="nav-icon">⭐</div>本年</div>
     </div>
 
     <script>
@@ -513,9 +741,10 @@ function getHTML() {
             categories: {
                 expense: ['餐饮 🍔', '购物 🛍️', '交通 🚗', '住房 🏠', '娱乐 🎮', '医疗 💊', '其他 📝'],
                 income: ['工资 💰', '奖金 💎', '理财 📈', '兼职 💼', '红包 🧧', '其他 📝']
-            }
+            },
+            chartInstance: null 
         };
-        let pendingDelete = null; // 存储待删除项信息
+        let pendingDelete = null; 
 
         function toggleGroup(groupId) {
             const group = document.getElementById(groupId);
@@ -535,7 +764,6 @@ function getHTML() {
         function openAddModal() { document.getElementById('addModal').classList.add('active'); hapticFeedback(); }
         function closeAddModal() { document.getElementById('addModal').classList.remove('active'); }
 
-        // --- 删除确认 Modal 逻辑 ---
         function openDeleteModal(id, element, content) {
             pendingDelete = { id, element, content };
             document.getElementById('deleteModal').classList.add('active');
@@ -544,7 +772,6 @@ function getHTML() {
 
         function cancelDelete() {
             document.getElementById('deleteModal').classList.remove('active');
-            // 回弹复位
             if (pendingDelete && pendingDelete.content) {
                 pendingDelete.content.style.transform = 'translateX(0)';
             }
@@ -557,28 +784,31 @@ function getHTML() {
 
             const { id, element, content } = pendingDelete;
             
-            // 执行视觉删除动画
             content.style.transition = 'transform 0.4s ease-out';
             content.style.transform = 'translateX(-100%)';
             hapticFeedback();
 
             await deleteItem(id);
             
-            // 列表项塌缩动画
+            await loadSummaryOnly();
+            
+            // 重新加载图表数据（根据当前选中周期）
+            if (state.period === 'weekly') await loadWeeklyChart(); // 🎯 新增
+            if (state.period === 'monthly') await loadDailyChart(); 
+            if (state.period === 'yearly') await loadYearlyChart(); 
+
             element.style.transition = 'opacity 0.3s ease 0.1s, margin 0.3s ease 0.1s, height 0.3s ease 0.1s, padding 0.3s ease 0.1s';
             element.style.opacity = '0';
             element.style.height = '0';
             element.style.margin = '0';
             element.style.padding = '0';
 
-            await loadSummaryOnly();
             setTimeout(() => element.remove(), 400);
             
             pendingDelete = null;
         }
         window.cancelDelete = cancelDelete;
         window.confirmDelete = confirmDelete;
-        // ---------------------------
 
         function setType(type) {
             state.type = type;
@@ -597,7 +827,27 @@ function getHTML() {
         function setPeriod(period, el) {
             state.period = period;
             document.querySelectorAll('.nav-item').forEach(t => { if (!t.classList.contains('add-btn')) t.classList.remove('active'); });
-            el.classList.add('active'); loadData(); hapticFeedback();
+            el.classList.add('active'); 
+            loadData(); 
+            
+            // 曲线图加载逻辑更新
+            const chartContainer = document.getElementById('dailyChartContainer');
+            if (period === 'monthly') {
+                chartContainer.style.display = 'block';
+                loadDailyChart(); // 加载每日曲线 (本月)
+            } else if (period === 'yearly') {
+                chartContainer.style.display = 'block';
+                loadYearlyChart(); // 加载每月曲线 (今年)
+            } else if (period === 'weekly') { // 🎯 新增：本周逻辑
+                chartContainer.style.display = 'block';
+                loadWeeklyChart(); // 加载每周曲线 (本周)
+            } else {
+                chartContainer.style.display = 'none';
+                if (state.chartInstance) state.chartInstance.destroy();
+                state.chartInstance = null;
+            }
+            
+            hapticFeedback();
         }
 
         async function loadData() {
@@ -606,14 +856,267 @@ function getHTML() {
                 const [txRes, sumRes] = await Promise.all([ fetch('/api/transactions'), fetch('/api/summary?period=' + state.period) ]);
                 const transactions = await txRes.json(); const summary = await sumRes.json();
                 renderSummary(summary); renderList(transactions);
+                
+                // 默认加载曲线图 (根据当前周期)
+                if (state.period === 'monthly') {
+                    document.getElementById('dailyChartContainer').style.display = 'block';
+                    await loadDailyChart(); 
+                } else if (state.period === 'yearly') {
+                    document.getElementById('dailyChartContainer').style.display = 'block';
+                    await loadYearlyChart(); 
+                } else if (state.period === 'weekly') { // 🎯 新增：本周逻辑
+                    document.getElementById('dailyChartContainer').style.display = 'block';
+                    await loadWeeklyChart(); 
+                } else {
+                    document.getElementById('dailyChartContainer').style.display = 'none';
+                }
+
             } catch (e) { document.getElementById('list').innerHTML = '<div class="empty-state" style="color: var(--danger)">⚠️ 数据加载失败</div>'; } 
             finally { setTimeout(() => indicator.classList.remove('active'), 300); }
         }
         
         async function loadSummaryOnly() {
-            try { const sumRes = await fetch('/api/summary?period=' + state.period); const summary = await sumRes.json(); renderSummary(summary); } catch (e) {}
+            try { 
+                const sumRes = await fetch('/api/summary?period=' + state.period); 
+                const summary = await sumRes.json(); 
+                renderSummary(summary); 
+            } catch (e) {}
         }
         window.loadSummaryOnly = loadSummaryOnly;
+        
+        // --- 每日净流量曲线逻辑 (本月) ---
+        async function loadDailyChart() {
+            if (state.period !== 'monthly') return;
+
+            const now = new Date();
+            const year = now.getFullYear();
+            const month = now.getMonth() + 1;
+
+            try {
+                const res = await fetch(\`/api/daily_balance?year=\${year}&month=\${month}\`);
+                const dailyData = await res.json();
+                renderDailyChart(dailyData);
+            } catch (e) {
+                console.error("加载每日净流量曲线失败", e);
+                const container = document.getElementById('dailyChartContainer');
+                container.innerHTML = '<div style="color:var(--text-muted);text-align:center;font-size:12px;">加载曲线失败</div>';
+            }
+        }
+        window.loadDailyChart = loadDailyChart;
+
+
+        function renderDailyChart(data) {
+            const ctx = document.getElementById('dailyBalanceChart').getContext('2d');
+            
+            const labels = data.map(d => d.day);
+            const netFlows = data.map(d => d.balance);
+
+            if (state.chartInstance) { state.chartInstance.destroy(); }
+
+            state.chartInstance = new Chart(ctx, {
+                type: 'bar', 
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: '每日净流量 (¥)',
+                        data: netFlows,
+                        backgroundColor: netFlows.map(amount => amount >= 0 ? 'rgba(16, 185, 129, 0.8)' : 'rgba(244, 63, 94, 0.8)'),
+                        borderColor: netFlows.map(amount => amount >= 0 ? 'var(--success)' : 'var(--danger)'),
+                        borderWidth: 1,
+                        borderRadius: 4,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: { 
+                            mode: 'index', 
+                            intersect: false, 
+                            titleFont: { size: 14, weight: 'bold' },
+                            bodyFont: { size: 13 },
+                            callbacks: {
+                                label: function(context) {
+                                    const value = context.parsed.y;
+                                    return (value >= 0 ? ' 净收入: ¥' : ' 净支出: ¥') + Math.abs(value).toFixed(2);
+                                },
+                                title: function(items) { return items[0].label + '日'; }
+                            },
+                        },
+                    },
+                    scales: {
+                        x: { 
+                            display: true, 
+                            title: { display: false },
+                            grid: { color: 'rgba(255,255,255,0.05)' },
+                            ticks: { color: 'var(--text-muted)' }
+                        },
+                        y: { 
+                            display: false, 
+                            title: { display: false },
+                            grid: { color: 'rgba(255,255,255,0.05)' }
+                        }
+                    },
+                }
+            });
+        }
+        
+        // --- 每月净流量曲线逻辑 (今年) ---
+        async function loadYearlyChart() {
+            if (state.period !== 'yearly') return;
+
+            const year = new Date().getFullYear();
+
+            try {
+                const res = await fetch(\`/api/monthly_balance?year=\${year}\`);
+                const monthlyData = await res.json();
+                renderYearlyChart(monthlyData);
+            } catch (e) {
+                console.error("加载每月净流量曲线失败", e);
+                const container = document.getElementById('dailyChartContainer');
+                container.innerHTML = '<div style="color:var(--text-muted);text-align:center;font-size:12px;">加载曲线失败</div>';
+            }
+        }
+        window.loadYearlyChart = loadYearlyChart;
+
+        function renderYearlyChart(data) {
+            const ctx = document.getElementById('dailyBalanceChart').getContext('2d');
+            
+            // 提取标签和数据 (现在是每月净流量)
+            const labels = data.map(d => d.month + '月');
+            const netFlows = data.map(d => d.balance);
+
+            if (state.chartInstance) { state.chartInstance.destroy(); }
+
+            state.chartInstance = new Chart(ctx, {
+                type: 'bar', // 柱状图 (Bar Chart)
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: '每月净流量 (¥)',
+                        data: netFlows,
+                        // 根据金额正负设置颜色
+                        backgroundColor: netFlows.map(amount => amount >= 0 ? 'rgba(16, 185, 129, 0.8)' : 'rgba(244, 63, 94, 0.8)'),
+                        borderColor: netFlows.map(amount => amount >= 0 ? 'var(--success)' : 'var(--danger)'),
+                        borderWidth: 1,
+                        borderRadius: 4,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: { 
+                            mode: 'index', 
+                            intersect: false, 
+                            titleFont: { size: 14, weight: 'bold' },
+                            bodyFont: { size: 13 },
+                            callbacks: {
+                                // 更新工具提示信息
+                                label: function(context) {
+                                    const value = context.parsed.y;
+                                    return (value >= 0 ? ' 净收入: ¥' : ' 净支出: ¥') + Math.abs(value).toFixed(2);
+                                },
+                                title: function(items) { return items[0].label; }
+                            },
+                        },
+                    },
+                    scales: {
+                        x: { 
+                            display: true, 
+                            title: { display: false },
+                            grid: { color: 'rgba(255,255,255,0.05)' },
+                            ticks: { color: 'var(--text-muted)' }
+                        },
+                        y: { 
+                            display: false, // 隐藏 Y 轴刻度，保持简洁
+                            title: { display: false },
+                            grid: { color: 'rgba(255,255,255,0.05)' }
+                        }
+                    },
+                }
+            });
+        }
+        
+        // --- 🎯 新增：加载每周净流量曲线逻辑 (本周) ---
+        async function loadWeeklyChart() {
+            if (state.period !== 'weekly') return;
+
+            try {
+                // 调用新的 API 路由
+                const res = await fetch(\`/api/weekly_balance\`);
+                const weeklyData = await res.json();
+                renderWeeklyChart(weeklyData);
+            } catch (e) {
+                console.error("加载每周净流量曲线失败", e);
+                const container = document.getElementById('dailyChartContainer');
+                container.innerHTML = '<div style="color:var(--text-muted);text-align:center;font-size:12px;">加载曲线失败</div>';
+            }
+        }
+        window.loadWeeklyChart = loadWeeklyChart;
+
+        function renderWeeklyChart(data) {
+            const ctx = document.getElementById('dailyBalanceChart').getContext('2d');
+            
+            // 提取标签和数据 (周一到周日)
+            const labels = data.map(d => '周' + d.day);
+            const netFlows = data.map(d => d.balance);
+
+            if (state.chartInstance) { state.chartInstance.destroy(); }
+
+            state.chartInstance = new Chart(ctx, {
+                type: 'bar', // 柱状图 (Bar Chart)
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: '每日净流量 (¥)',
+                        data: netFlows,
+                        // 根据金额正负设置颜色
+                        backgroundColor: netFlows.map(amount => amount >= 0 ? 'rgba(16, 185, 129, 0.8)' : 'rgba(244, 63, 94, 0.8)'),
+                        borderColor: netFlows.map(amount => amount >= 0 ? 'var(--success)' : 'var(--danger)'),
+                        borderWidth: 1,
+                        borderRadius: 4,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: { 
+                            mode: 'index', 
+                            intersect: false, 
+                            titleFont: { size: 14, weight: 'bold' },
+                            bodyFont: { size: 13 },
+                            callbacks: {
+                                // 更新工具提示信息
+                                label: function(context) {
+                                    const value = context.parsed.y;
+                                    return (value >= 0 ? ' 净收入: ¥' : ' 净支出: ¥') + Math.abs(value).toFixed(2);
+                                },
+                                title: function(items) { return items[0].label; }
+                            },
+                        },
+                    },
+                    scales: {
+                        x: { 
+                            display: true, 
+                            title: { display: false },
+                            grid: { color: 'rgba(255,255,255,0.05)' },
+                            ticks: { color: 'var(--text-muted)' }
+                        },
+                        y: { 
+                            display: false, // 隐藏 Y 轴刻度，保持简洁
+                            title: { display: false },
+                            grid: { color: 'rgba(255,255,255,0.05)' }
+                        }
+                    },
+                }
+            });
+        }
+        // --- 结束：周图表逻辑修改 ---
 
         function renderSummary(data) {
             const balEl = document.getElementById('balanceDisplay');
@@ -676,7 +1179,6 @@ function getHTML() {
                     const deleteThreshold = -item.offsetWidth * 0.4;
                     const currentOffset = parseInt(content.style.transform.replace('translateX(', '')) || 0;
                     if (currentOffset < deleteThreshold) {
-                        // 触发自定义删除弹窗
                         openDeleteModal(item.dataset.id, item, content);
                     } else { content.style.transform = 'translateX(0)'; }
                     if (itemMoved) e.stopPropagation(); itemMoved = false;
@@ -686,8 +1188,24 @@ function getHTML() {
 
         document.getElementById('addForm').onsubmit = async (e) => {
             e.preventDefault(); const btn = e.target.querySelector('button'); btn.disabled = true; btn.innerText = '保存中...'; hapticFeedback();
-            try { await fetch('/api/transactions', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ type: state.type, amount: document.getElementById('amount').value, category: document.getElementById('category').value, description: document.getElementById('desc').value }) }); document.getElementById('amount').value = ''; document.getElementById('desc').value = ''; closeAddModal(); await loadData(); } 
-            catch(e) { alert('保存失败'); } finally { btn.disabled = false; btn.innerText = '确认添加'; }
+            try { 
+                await fetch('/api/transactions', { 
+                    method: 'POST', 
+                    headers: {'Content-Type': 'application/json'}, 
+                    body: JSON.stringify({ 
+                        type: state.type, 
+                        amount: document.getElementById('amount').value, 
+                        category: document.getElementById('category').value, 
+                        description: document.getElementById('desc').value 
+                    }) 
+                }); 
+                document.getElementById('amount').value = ''; 
+                document.getElementById('desc').value = ''; 
+                closeAddModal(); 
+                await loadData();
+            } 
+            catch(e) { alert('保存失败'); } 
+            finally { btn.disabled = false; btn.innerText = '确认添加'; }
         };
 
         async function deleteItem(id) { await fetch('/api/transactions/' + id, { method: 'DELETE' }); }
