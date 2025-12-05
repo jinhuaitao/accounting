@@ -1053,7 +1053,7 @@ function getHTML() {
             if (add || period) window.history.replaceState(null, null, window.location.pathname); 
         }
 
-        function vibrate() { if (window.navigator.vibrate) window.navigator.vibrate(10); }
+        function vibrate() { if (window.navigator.vibrate) window.navigator.vibrate(50); }
         function openAddModal() { document.getElementById('addModal').classList.add('active'); document.getElementById('overlay').classList.add('active'); document.getElementById('amount').focus(); vibrate(); }
         function closeAll() { document.getElementById('addModal').classList.remove('active'); document.getElementById('deleteModal').classList.remove('active'); document.getElementById('overlay').classList.remove('active'); if (pendingDelete) { pendingDelete.content.style.transform = 'translateX(0)'; pendingDelete = null; } }
         function openDeleteModal(id, element, content) { pendingDelete = { id, element, content }; document.getElementById('deleteModal').classList.add('active'); document.getElementById('overlay').classList.add('active'); vibrate(); }
