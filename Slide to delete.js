@@ -99,7 +99,7 @@ async function handleAPIRequest(request, env, path, method) {
 
   if (path === '/api/auth/login' && method === 'POST') {
     const { password } = await request.json();
-    const correctPassword = await kv.get('app_password') || 'admin123'; 
+    const correctPassword = env.ADMIN_PASSWORD || await kv.get('app_password'); 
     
     if (password === correctPassword) {
       const token = generateToken();
