@@ -49,7 +49,7 @@
 变量名 (Variable name) 填写：ACCOUNTING_BUCKET (必须完全一致)。
 选择您刚才创建的 Bucket。
 
-### 第六步：上传代码
+### 第六步：Cloudflare Turnstile
 
 Cloudflare Turnstile 验证的具体指南。
 
