@@ -49,7 +49,15 @@
 变量名 (Variable name) 填写：ACCOUNTING_BUCKET (必须完全一致)。
 选择您刚才创建的 Bucket。
 
-### 第六步：Cloudflare Turnstile
+### 第六步：上传代码
+
+1. 点击 **"Quick edit"** 或返回 Worker 主页面点击 **"Edit code"**
+2. 删除默认的代码（类似 `export default { ... }` 的内容）
+3. 复制我们项目中的 `index.js` 文件的全部内容
+4. 粘贴到编辑器中
+5. 点击 **"Save and Deploy"**
+6. 
+### 第七步：Cloudflare Turnstile
 
 Cloudflare Turnstile 验证的具体指南。
 
@@ -63,13 +71,7 @@ Cloudflare Turnstile 验证的具体指南。
 在 Worker 的设置 (Settings) > 变量 (Variables) 中，添加一个名为 TURNSTILE_SECRET 的环境变量，填入你的 Secret Key。
 修改第742行里找到 data-sitekey="REPLACE_WITH_YOUR_SITE_KEY"，将其替换为你自己的 Site Key
 
-### 第七步：上传代码
 
-1. 点击 **"Quick edit"** 或返回 Worker 主页面点击 **"Edit code"**
-2. 删除默认的代码（类似 `export default { ... }` 的内容）
-3. 复制我们项目中的 `index.js` 文件的全部内容
-4. 粘贴到编辑器中
-5. 点击 **"Save and Deploy"**
 
 ### 第八步：设置密码（可选）
 
