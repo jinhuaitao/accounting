@@ -16,7 +16,7 @@ export default {
       }
   
       try {
-        // 鉴权逻辑
+        // 鉴权逻辑 (依赖 KV)
         if (path !== '/login' && !path.startsWith('/api/auth')) {
           const isAuthenticated = await checkAuthentication(request, env);
           if (!isAuthenticated) {
@@ -27,6 +27,7 @@ export default {
           }
         }
   
+        // 首页 HTML
         if (path === '/') {
           return new Response(getHTML(), {
             headers: { 'Content-Type': 'text/html', ...corsHeaders },
@@ -78,7 +79,9 @@ export default {
     },
   };
   
-  // --- 核心逻辑 (保持不变) ---
+  // --- 核心逻辑 ---
+  
+  // 鉴权仍然使用 KV
   async function checkAuthentication(request, env) {
     const cookieHeader = request.headers.get('Cookie') || '';
     const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
@@ -93,10 +96,48 @@ export default {
     return false;
   }
   
+  // --- 关键修改：智能读取函数 (含自动迁移) ---
+  async function getTransactionsFromR2(env, userId) {
+      const r2Key = `transactions_${userId}.json`;
+      
+      // 1. 优先尝试从 R2 读取
+      const object = await env.ACCOUNTING_BUCKET.get(r2Key);
+      
+      if (object !== null) {
+          // R2 有数据，直接返回
+          try {
+              return await object.json();
+          } catch (e) {
+              console.error("R2 JSON parse error", e);
+              return [];
+          }
+      }
+  
+      // 2. R2 是空的？检查 KV 是否有旧数据 (自动迁移逻辑)
+      const kvKey = `transactions_${userId}`;
+      const oldData = await env.ACCOUNTING_KV.get(kvKey, 'json');
+      
+      if (oldData && Array.isArray(oldData) && oldData.length > 0) {
+          // 发现 KV 有数据！立刻搬运到 R2
+          await env.ACCOUNTING_BUCKET.put(r2Key, JSON.stringify(oldData));
+          return oldData; // 返回旧数据
+      }
+  
+      // 3. 都没有，确实是新用户
+      return [];
+  }
+  
+  // 写入数据到 R2
+  async function saveTransactionsToR2(env, userId, data) {
+      const key = `transactions_${userId}.json`;
+      await env.ACCOUNTING_BUCKET.put(key, JSON.stringify(data));
+  }
+  
   async function handleAPIRequest(request, env, path, method) {
-    const kv = env.ACCOUNTING_KV;
+    const kv = env.ACCOUNTING_KV; 
     const userId = 'default_user'; 
   
+    // --- Auth API (KV) ---
     if (path === '/api/auth/login' && method === 'POST') {
       const { password } = await request.json();
       const correctPassword = env.ADMIN_PASSWORD || await kv.get('app_password');
@@ -131,32 +172,40 @@ export default {
       });
     }
   
+    // --- Transaction API (智能 R2) ---
+    
     if (path === '/api/transactions') {
       if (method === 'GET') {
-        const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
+        const transactions = await getTransactionsFromR2(env, userId);
         return new Response(JSON.stringify(transactions), { headers: { 'Content-Type': 'application/json' } });
       }
       if (method === 'POST') {
         const transaction = await request.json();
         transaction.id = generateToken();
         transaction.timestamp = new Date().toISOString();
-        const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
+        
+        const transactions = await getTransactionsFromR2(env, userId);
         transactions.push(transaction);
-        await kv.put(`transactions_${userId}`, JSON.stringify(transactions));
+        
+        await saveTransactionsToR2(env, userId, transactions);
+        
         return new Response(JSON.stringify(transactions), { status: 201, headers: { 'Content-Type': 'application/json' } });
       }
     }
   
     if (path.startsWith('/api/transactions/') && method === 'DELETE') {
       const transactionId = path.split('/').pop();
-      const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
+      
+      const transactions = await getTransactionsFromR2(env, userId);
       const filteredTransactions = transactions.filter(t => t.id !== transactionId);
-      await kv.put(`transactions_${userId}`, JSON.stringify(filteredTransactions));
+      
+      await saveTransactionsToR2(env, userId, filteredTransactions);
+      
       return new Response(JSON.stringify(filteredTransactions), { headers: { 'Content-Type': 'application/json' } });
     }
   
     if (path === '/api/daily_balance') {
-        const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
+        const transactions = await getTransactionsFromR2(env, userId);
         const url = new URL(request.url);
         const targetYear = parseInt(url.searchParams.get('year') || new Date().getFullYear());
         const targetMonth = parseInt(url.searchParams.get('month') || new Date().getMonth() + 1);
@@ -165,7 +214,7 @@ export default {
     }
     
     if (path === '/api/monthly_balance') {
-      const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
+      const transactions = await getTransactionsFromR2(env, userId);
       const url = new URL(request.url);
       const targetYear = parseInt(url.searchParams.get('year') || new Date().getFullYear());
       const monthlyBalances = calculateMonthlyNetFlow(transactions, targetYear);
@@ -173,7 +222,7 @@ export default {
     }
     
     if (path === '/api/weekly_balance') {
-      const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
+      const transactions = await getTransactionsFromR2(env, userId);
       const weeklyBalances = calculateWeeklyNetFlow(transactions);
       return new Response(JSON.stringify(weeklyBalances), { headers: { 'Content-Type': 'application/json' } });
     }
@@ -181,7 +230,7 @@ export default {
     if (path === '/api/summary') {
       const url = new URL(request.url);
       const period = url.searchParams.get('period') || 'daily';
-      const transactions = await kv.get(`transactions_${userId}`, 'json') || [];
+      const transactions = await getTransactionsFromR2(env, userId);
       const summary = calculateSummary(transactions, period);
       return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
     }
@@ -189,7 +238,7 @@ export default {
     return new Response('Not Found', { status: 404 });
   }
   
-  // --- 逻辑函数 ---
+  // --- 逻辑函数 (保持不变) ---
   function calculateDailyBalances(transactions, targetYear, targetMonth) {
       const monthlyTransactions = transactions.filter(t => {
           const d = new Date(t.timestamp);
@@ -310,7 +359,7 @@ export default {
   
   function getServiceWorker() {
     return `
-  const CACHE_NAME = 'aurora-app-v25';
+  const CACHE_NAME = 'aurora-app-v28';
   const urlsToCache = [
     '/', 
     '/manifest.json',
@@ -1323,12 +1372,12 @@ export default {
               container.querySelectorAll('.t-item').forEach(item => {
                   const content = item.querySelector('.t-content'); 
                   let startX = 0; 
-                  let startY = 0; // 新增Y轴检测
+                  let startY = 0; 
                   let isDragging = false;
                   
                   item.addEventListener('touchstart', (e) => { 
                       startX = e.touches[0].clientX; 
-                      startY = e.touches[0].clientY; // 记录初始Y
+                      startY = e.touches[0].clientY; 
                       content.style.transition = 'none'; 
                       isDragging = false;
                   }, { passive: true });
@@ -1339,8 +1388,7 @@ export default {
                       const diffX = currentX - startX; 
                       const diffY = currentY - startY;
   
-                      // 关键修复：只有当水平移动距离 > 垂直移动距离时，才视为滑动删除
-                      // 并且是向左滑 (diffX < 0)
+                      // 防误触逻辑：水平移动 > 垂直移动时才触发左滑
                       if (Math.abs(diffX) > Math.abs(diffY) && diffX < 0) {
                            if (diffX > -120) { 
                                content.style.transform = \`translateX(\${diffX}px)\`; 
@@ -1352,7 +1400,7 @@ export default {
                   item.addEventListener('touchend', (e) => { 
                       content.style.transition = 'transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275)'; 
                       const currentOffset = parseInt(content.style.transform.replace('translateX(', '')) || 0; 
-                      if (currentOffset < -60) { 
+                      if (currentOffset < -75) { 
                           openDeleteModal(item.dataset.id, item, content); 
                       } else { 
                           content.style.transform = 'translateX(0)'; 
