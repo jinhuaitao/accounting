@@ -203,7 +203,8 @@ index.js
 这样你就完全通过网页界面成功部署了记账应用！🎉
 ## 图片展示
 
-<img width="493" height="668" alt="image" src="https://github.com/user-attachments/assets/a3336108-9d6b-40da-a6ad-0b2f02d52968" />
+<img width="603" height="1096" alt="image" src="https://github.com/user-attachments/assets/4a11fed7-fa72-4155-8e73-9e6697fb489b" />
+<img width="588" height="1092" alt="image" src="https://github.com/user-attachments/assets/f2f3a9e5-a58e-4706-9d24-fc3b6d1a6a19" />
 <img width="598" height="1095" alt="image" src="https://github.com/user-attachments/assets/dba2be73-464d-492b-8215-f6c9aabd430d" />
 <img width="592" height="1091" alt="image" src="https://github.com/user-attachments/assets/02c03cf5-fa08-4066-acb2-b726e37e03a9" />
 <img width="593" height="1090" alt="image" src="https://github.com/user-attachments/assets/94c04768-7030-486b-93bf-5519ff537b40" />
