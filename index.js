@@ -310,7 +310,7 @@ export default {
   
   function getServiceWorker() {
     return `
-  const CACHE_NAME = 'aurora-app-v24';
+  const CACHE_NAME = 'aurora-app-v25';
   const urlsToCache = [
     '/', 
     '/manifest.json',
@@ -1255,7 +1255,7 @@ export default {
                            backgroundColor: data.map(d => d.value >= 0 ? gradientInc : gradientExp), 
                            borderRadius: 100, // 完全圆角
                            borderSkipped: false,
-                           barThickness: 6, // 细长条
+                           barThickness: 8, // 细长条
                        }] 
                    }, 
                    options: { 
@@ -1321,10 +1321,44 @@ export default {
               });
               container.innerHTML = html;
               container.querySelectorAll('.t-item').forEach(item => {
-                  const content = item.querySelector('.t-content'); let startX = 0; let isDragging = false;
-                  item.addEventListener('touchstart', (e) => { startX = e.touches[0].clientX; content.style.transition = 'none'; }, { passive: true });
-                  item.addEventListener('touchmove', (e) => { const diff = e.touches[0].clientX - startX; if (diff < 0 && diff > -120) { content.style.transform = \`translateX(\${diff}px)\`; isDragging = true; } }, { passive: true });
-                  item.addEventListener('touchend', (e) => { content.style.transition = 'transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275)'; const currentOffset = parseInt(content.style.transform.replace('translateX(', '')) || 0; if (currentOffset < -60) { openDeleteModal(item.dataset.id, item, content); } else { content.style.transform = 'translateX(0)'; } isDragging = false; });
+                  const content = item.querySelector('.t-content'); 
+                  let startX = 0; 
+                  let startY = 0; // 新增Y轴检测
+                  let isDragging = false;
+                  
+                  item.addEventListener('touchstart', (e) => { 
+                      startX = e.touches[0].clientX; 
+                      startY = e.touches[0].clientY; // 记录初始Y
+                      content.style.transition = 'none'; 
+                      isDragging = false;
+                  }, { passive: true });
+                  
+                  item.addEventListener('touchmove', (e) => { 
+                      const currentX = e.touches[0].clientX;
+                      const currentY = e.touches[0].clientY;
+                      const diffX = currentX - startX; 
+                      const diffY = currentY - startY;
+  
+                      // 关键修复：只有当水平移动距离 > 垂直移动距离时，才视为滑动删除
+                      // 并且是向左滑 (diffX < 0)
+                      if (Math.abs(diffX) > Math.abs(diffY) && diffX < 0) {
+                           if (diffX > -120) { 
+                               content.style.transform = \`translateX(\${diffX}px)\`; 
+                               isDragging = true; 
+                           } 
+                      }
+                  }, { passive: true });
+                  
+                  item.addEventListener('touchend', (e) => { 
+                      content.style.transition = 'transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275)'; 
+                      const currentOffset = parseInt(content.style.transform.replace('translateX(', '')) || 0; 
+                      if (currentOffset < -60) { 
+                          openDeleteModal(item.dataset.id, item, content); 
+                      } else { 
+                          content.style.transform = 'translateX(0)'; 
+                      } 
+                      isDragging = false; 
+                  });
               });
           }
   
