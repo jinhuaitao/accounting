@@ -4,26 +4,29 @@ export default {
       const path = url.pathname;
       const method = request.method;
   
-      // CORS headers
-      const corsHeaders = {
-        'Access-Control-Allow-Origin': '*',
+      // 安全响应头
+      const securityHeaders = {
+        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self';",
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+        'Referrer-Policy': 'strict-origin-when-cross-origin',
+        'Access-Control-Allow-Origin': url.origin, // 仅允许同源
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type',
       };
   
       if (method === 'OPTIONS') {
-        return new Response(null, { headers: corsHeaders });
+        return new Response(null, { headers: securityHeaders });
       }
   
       try {
-        // --- 路由守卫 ---
-        // 排除登录页、Auth API、静态资源
+        // 路由守卫
         if (path !== '/login' && !path.startsWith('/api/auth') && path !== '/manifest.json' && path !== '/sw.js') {
           const isAuthenticated = await checkAuthentication(request, env);
           if (!isAuthenticated) {
             return new Response(getLoginPageHTML(), {
               status: 302,
-              headers: { 'Content-Type': 'text/html', ...corsHeaders },
+              headers: { 'Content-Type': 'text/html', ...securityHeaders },
             });
           }
         }
@@ -31,19 +34,19 @@ export default {
         // 首页 HTML
         if (path === '/') {
           return new Response(getHTML(), {
-            headers: { 'Content-Type': 'text/html', ...corsHeaders },
+            headers: { 'Content-Type': 'text/html', ...securityHeaders },
           });
         }
   
-        // API 路由逻辑
+        // API 路由
         if (path.startsWith('/api/')) {
           const response = await handleAPIRequest(request, env, path, method);
-          Object.entries(corsHeaders).forEach(([key, value]) => {
+          Object.entries(securityHeaders).forEach(([key, value]) => {
             response.headers.set(key, value);
           });
           return response;
         }
-        
+  
         // PWA Manifest
         if (path === '/manifest.json') {
           return new Response(getManifest(), {
@@ -53,7 +56,7 @@ export default {
             },
           });
         }
-        
+  
         // Service Worker
         if (path === '/sw.js') {
           return new Response(getServiceWorker(), {
@@ -66,7 +69,7 @@ export default {
   
         if (path === '/login') {
           return new Response(getLoginPageHTML(), {
-            headers: { 'Content-Type': 'text/html', ...corsHeaders },
+            headers: { 'Content-Type': 'text/html', ...securityHeaders },
           });
         }
   
@@ -74,13 +77,64 @@ export default {
       } catch (error) {
         return new Response(JSON.stringify({ error: error.message }), {
           status: 500,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          headers: { 'Content-Type': 'application/json', ...securityHeaders },
         });
       }
     },
   };
   
-  // --- 鉴权辅助函数 ---
+  // --- 安全辅助函数 (核心修改) ---
+  
+  // 1. 密码加盐哈希 (PBKDF2)
+  async function hashPassword(password, salt = null) {
+    const enc = new TextEncoder();
+    if (!salt) {
+      salt = crypto.getRandomValues(new Uint8Array(16)); // 生成随机盐
+    } else {
+      // 恢复盐的格式
+      salt = Uint8Array.from(atob(salt), c => c.charCodeAt(0));
+    }
+    
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveBits", "deriveKey"]
+    );
+    
+    const key = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: salt, iterations: 100000, hash: "SHA-256" },
+      keyMaterial, { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]
+    );
+    
+    // 导出 Key 为 Raw 数据用于存储
+    const exported = await crypto.subtle.exportKey("raw", key);
+    
+    // 返回 base64 格式的 Salt 和 Hash
+    const saltStr = btoa(String.fromCharCode(...salt));
+    const hashStr = btoa(String.fromCharCode(...new Uint8Array(exported)));
+    return { salt: saltStr, hash: hashStr };
+  }
+  
+  // 2. 验证密码
+  async function verifyPassword(inputPassword, storedSalt, storedHash) {
+    const result = await hashPassword(inputPassword, storedSalt);
+    return result.hash === storedHash;
+  }
+  
+  // 3. 安全随机 Token
+  function generateSecureToken() {
+    const array = new Uint8Array(32);
+    crypto.getRandomValues(array);
+    return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+  
+  // 4. 输入清洗 (防止 XSS)
+  function sanitize(str) {
+    if (typeof str !== 'string') return str;
+    return str.replace(/[&<>"'/]/g, (char) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '/': '&#x2F;'
+    }[char]));
+  }
+  
+  // --- 鉴权逻辑 ---
   async function checkAuthentication(request, env) {
     const cookieHeader = request.headers.get('Cookie') || '';
     const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
@@ -95,7 +149,6 @@ export default {
     return false;
   }
   
-  // 获取当前请求的用户信息 (用于数据隔离)
   async function getCurrentUser(request, env) {
     const kv = env.ACCOUNTING_KV;
     const cookieHeader = request.headers.get('Cookie') || '';
@@ -108,29 +161,19 @@ export default {
     if (cookies.auth_token) {
       const sessionStr = await kv.get(`session_${cookies.auth_token}`);
       if (sessionStr) {
-        return JSON.parse(sessionStr); // 返回 { userId, username, ... }
+        return JSON.parse(sessionStr); 
       }
     }
     return null;
   }
   
-  // --- R2 数据存取逻辑 ---
+  // --- R2 逻辑 (不变) ---
   async function getTransactionsFromR2(env, userId) {
       const r2Key = `transactions_${userId}.json`;
-      
-      // 尝试从 R2 读取
       const object = await env.ACCOUNTING_BUCKET.get(r2Key);
-      
       if (object !== null) {
-          try {
-              return await object.json();
-          } catch (e) {
-              console.error("R2 JSON parse error", e);
-              return [];
-          }
+          try { return await object.json(); } catch (e) { return []; }
       }
-  
-      // 新用户或无数据，返回空数组
       return [];
   }
   
@@ -139,64 +182,87 @@ export default {
       await env.ACCOUNTING_BUCKET.put(key, JSON.stringify(data));
   }
   
-  // --- 核心 API 处理 ---
+  // --- API 处理逻辑 ---
   async function handleAPIRequest(request, env, path, method) {
     const kv = env.ACCOUNTING_KV; 
   
-    // 1. 注册接口
+    // --- 1. 注册接口 (安全升级) ---
     if (path === '/api/auth/register' && method === 'POST') {
       try {
         const { username, password } = await request.json();
         if (!username || !password) return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400 });
         
-        // 检查用户是否存在
-        const existingUser = await kv.get(`u_${username}`);
-        if (existingUser) {
-          return new Response(JSON.stringify({ error: '用户名已存在' }), { status: 409 });
-        }
+        const cleanUsername = sanitize(username); // 清洗用户名
   
-        // 创建新用户 (生成唯一 userId)
-        const userId = generateToken(); 
-        const userData = { password, userId, createdAt: Date.now() };
+        const existingUser = await kv.get(`u_${cleanUsername}`);
+        if (existingUser) return new Response(JSON.stringify({ error: '用户名已存在' }), { status: 409 });
+  
+        // **关键修改：密码哈希存储**
+        const { salt, hash } = await hashPassword(password);
+        const userId = generateSecureToken(); // 使用安全 UUID
         
-        // 存储用户数据
-        await kv.put(`u_${username}`, JSON.stringify(userData));
+        const userData = { 
+          salt, 
+          hash, // 存哈希，不存明文
+          userId, 
+          createdAt: Date.now() 
+        };
+        
+        await kv.put(`u_${cleanUsername}`, JSON.stringify(userData));
   
-        return new Response(JSON.stringify({ success: true }), { 
-          status: 200, 
-          headers: { 'Content-Type': 'application/json' } 
-        });
+        return new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 500 });
       }
     }
   
-    // 2. 登录接口 (纯净版：仅支持用户名+密码)
+    // --- 2. 登录接口 (安全升级：防爆破 + 哈希比对) ---
     if (path === '/api/auth/login' && method === 'POST') {
       const { username, password } = await request.json();
+      if (!username || !password) return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400 });
+  
+      const cleanUsername = sanitize(username);
+      const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+      const rateLimitKey = `limit_${ip}`;
       
-      if (!username || !password) {
-        return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      // **防暴力破解检测**
+      let attempts = parseInt(await kv.get(rateLimitKey) || '0');
+      if (attempts >= 5) {
+          return new Response(JSON.stringify({ error: '尝试次数过多，请15分钟后再试' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
       }
   
-      // 查询 KV 用户
-      const userStr = await kv.get(`u_${username}`);
+      const userStr = await kv.get(`u_${cleanUsername}`);
       
       if (userStr) {
         const userData = JSON.parse(userStr);
-        if (userData.password === password) {
-          const token = generateToken();
-          // Session 存储具体的 userId
-          await kv.put(`session_${token}`, JSON.stringify({ userId: userData.userId, username }), { expirationTtl: 86400 });
+        // **关键修改：哈希验证**
+        // 兼容逻辑：如果是旧数据(没有salt)，提示重置。如果是新数据，进行 Verify。
+        if (!userData.salt || !userData.hash) {
+             return new Response(JSON.stringify({ error: '账号数据需升级，请联系管理员或重新注册' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+        }
+  
+        const isValid = await verifyPassword(password, userData.salt, userData.hash);
+  
+        if (isValid) {
+          // 登录成功，清除错误计数
+          await kv.delete(rateLimitKey);
+  
+          const token = generateSecureToken();
+          await kv.put(`session_${token}`, JSON.stringify({ userId: userData.userId, username: cleanUsername }), { expirationTtl: 86400 });
+          
+          // **Cookie 安全属性**
           return new Response(JSON.stringify({ success: true, token }), {
             status: 200,
             headers: { 
               'Content-Type': 'application/json',
-              'Set-Cookie': `auth_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`
+              'Set-Cookie': `auth_token=${token}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=86400`
             },
           });
         }
       }
+      
+      // 登录失败：记录尝试次数 (TTL 15分钟)
+      await kv.put(rateLimitKey, (attempts + 1).toString(), { expirationTtl: 900 });
       return new Response(JSON.stringify({ error: '账号或密码错误' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
   
@@ -211,18 +277,17 @@ export default {
       if (cookies.auth_token) await kv.delete(`session_${cookies.auth_token}`);
       return new Response(JSON.stringify({ success: true }), {
         status: 200,
-        headers: { 'Content-Type': 'application/json', 'Set-Cookie': 'auth_token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0' },
+        headers: { 'Content-Type': 'application/json', 'Set-Cookie': 'auth_token=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0' },
       });
     }
   
-    // --- 以下所有业务接口，必须获取当前 userId ---
     const currentUser = await getCurrentUser(request, env);
     if (!currentUser) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
     }
-    const userId = currentUser.userId; // 关键：数据隔离核心
+    const userId = currentUser.userId;
   
-    // --- 账单业务逻辑 ---
+    // --- 账单业务逻辑 (输入清洗) ---
     
     if (path === '/api/transactions') {
       if (method === 'GET') {
@@ -230,15 +295,21 @@ export default {
         return new Response(JSON.stringify(transactions), { headers: { 'Content-Type': 'application/json' } });
       }
       if (method === 'POST') {
-        const transaction = await request.json();
-        transaction.id = generateToken();
-        transaction.timestamp = new Date().toISOString();
+        const rawTx = await request.json();
+        
+        // **输入清洗**
+        const transaction = {
+            id: generateSecureToken(),
+            timestamp: new Date().toISOString(),
+            type: rawTx.type,
+            amount: parseFloat(rawTx.amount), // 强制转数字
+            category: sanitize(rawTx.category), // 清洗
+            description: sanitize(rawTx.description) // 清洗
+        };
         
         const transactions = await getTransactionsFromR2(env, userId);
         transactions.push(transaction);
-        
         await saveTransactionsToR2(env, userId, transactions);
-        
         return new Response(JSON.stringify(transactions), { status: 201, headers: { 'Content-Type': 'application/json' } });
       }
     }
@@ -285,7 +356,7 @@ export default {
     return new Response('Not Found', { status: 404 });
   }
   
-  // --- 数据计算逻辑函数 (保持不变) ---
+  // --- 计算逻辑 (不变) ---
   function calculateDailyBalances(transactions, targetYear, targetMonth) {
       const monthlyTransactions = transactions.filter(t => {
           const d = new Date(t.timestamp);
@@ -406,7 +477,7 @@ export default {
   
   function getServiceWorker() {
     return `
-  const CACHE_NAME = 'aurora-app-v30';
+  const CACHE_NAME = 'aurora-app-v31-secure';
   const urlsToCache = [
     '/', 
     '/manifest.json',
@@ -509,8 +580,6 @@ export default {
     }`;
   }
   
-  function generateToken() { return Math.random().toString(36).substring(2) + Date.now().toString(36); }
-  
   function calculateSummary(transactions, period = 'daily') {
     let income = 0, expense = 0;
     const now = new Date();
@@ -566,11 +635,12 @@ export default {
               background: rgba(30, 41, 59, 0.3); 
               backdrop-filter: blur(24px) saturate(180%); -webkit-backdrop-filter: blur(24px) saturate(180%); 
               border: 1px solid rgba(255, 255, 255, 0.1); 
-              padding: 56px 40px; border-radius: 40px; 
+              padding: 48px 40px; border-radius: 40px; 
               width: 85%; max-width: 380px; text-align: center; 
               box-shadow: 0 40px 80px -12px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(255,255,255,0.05); 
               animation: floatIn 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); 
               position: relative; overflow: hidden;
+              transition: height 0.3s ease;
           }
           .card::before {
               content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
@@ -580,15 +650,15 @@ export default {
           .card:hover::before { left: 100%; transition: 0.8s ease-in-out; }
           @keyframes floatIn { from { opacity: 0; transform: translateY(30px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
           
-          .logo-img { width: 88px; height: 88px; margin-bottom: 24px; filter: drop-shadow(0 0 30px rgba(139,92,246,0.4)); border-radius: 24px; transition: transform 0.5s ease; }
+          .logo-img { width: 80px; height: 80px; margin-bottom: 20px; filter: drop-shadow(0 0 30px rgba(139,92,246,0.4)); border-radius: 24px; transition: transform 0.5s ease; }
           .card:hover .logo-img { transform: scale(1.05) rotate(3deg); }
           
-          h1 { margin: 0 0 12px 0; font-size: 32px; font-weight: 800; color: white; letter-spacing: -1px; background: linear-gradient(to right, #fff, #c4b5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-          p { margin: 0 0 40px 0; color: #94a3b8; font-size: 15px; font-weight: 500; }
+          h1 { margin: 0 0 8px 0; font-size: 32px; font-weight: 800; color: white; letter-spacing: -1px; background: linear-gradient(to right, #fff, #c4b5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+          p { margin: 0 0 32px 0; color: #94a3b8; font-size: 15px; font-weight: 500; }
           
-          .input-group { position: relative; margin-bottom: 16px; }
+          .input-group { position: relative; margin-bottom: 16px; transition: all 0.3s ease; }
           input { 
-              width: 100%; padding: 18px 24px; border-radius: 20px; 
+              width: 100%; padding: 16px 24px; border-radius: 20px; 
               border: 1px solid rgba(255,255,255,0.08); 
               background: rgba(0,0,0,0.2); 
               color: white; font-size: 16px; 
@@ -597,6 +667,11 @@ export default {
           }
           input::placeholder { color: #64748b; font-family: 'Plus Jakarta Sans', sans-serif; letter-spacing: normal; }
           input:focus { border-color: rgba(139, 92, 246, 0.5); background: rgba(0,0,0,0.4); box-shadow: 0 0 0 4px rgba(139,92,246,0.15); transform: translateY(-2px); }
+          
+          /* 验证码样式 */
+          .captcha-row { display: flex; align-items: center; justify-content: center; gap: 12px; }
+          .captcha-label { color: white; font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 700; min-width: 80px; text-align: right; }
+          #captcha-input { width: 120px; text-align: center; padding-left: 10px; padding-right: 10px; }
           
           button { 
               width: 100%; padding: 18px; border-radius: 20px; border: none; margin-top: 10px;
@@ -617,6 +692,9 @@ export default {
           
           .error { color: #f43f5e; font-size: 14px; margin-bottom: 20px; display: none; background: rgba(244,63,94,0.15); padding: 12px; border-radius: 16px; animation: shake 0.5s cubic-bezier(.36,.07,.19,.97) both; }
           @keyframes shake { 10%, 90% { transform: translate3d(-1px, 0, 0); } 20%, 80% { transform: translate3d(2px, 0, 0); } 30%, 50%, 70% { transform: translate3d(-4px, 0, 0); } 40%, 60% { transform: translate3d(4px, 0, 0); } }
+          
+          /* 隐藏注册专用字段 */
+          .register-only { display: none; }
       </style>
   </head>
   <body>
@@ -626,6 +704,7 @@ export default {
           <h1 id="title">Welcome</h1>
           <p id="subtitle">登录您的个人账本</p>
           <div id="error" class="error"></div>
+          
           <form id="form">
               <div class="input-group">
                   <input type="text" id="username" placeholder="用户名" required autocomplete="username">
@@ -633,46 +712,113 @@ export default {
               <div class="input-group">
                   <input type="password" id="pwd" placeholder="密码" required autocomplete="current-password">
               </div>
+              
+              <div class="input-group register-only" id="group-confirm">
+                  <input type="password" id="pwd-confirm" placeholder="再次输入密码" autocomplete="new-password">
+              </div>
+              
+              <div class="input-group register-only" id="group-captcha">
+                  <div class="captcha-row">
+                      <div class="captcha-label" id="captcha-question">1+1=?</div>
+                      <input type="number" id="captcha-input" placeholder="计算结果" inputmode="numeric">
+                  </div>
+              </div>
+  
               <button type="submit" id="btn">立即登录</button>
           </form>
+          
           <div class="switch-mode" id="switchBtn" onclick="toggleMode()">没有账号？点击注册</div>
       </div>
+  
       <script>
           let isLogin = true;
-          const title = document.getElementById('title');
-          const subtitle = document.getElementById('subtitle');
-          const btn = document.getElementById('btn');
-          const switchBtn = document.getElementById('switchBtn');
-          const form = document.getElementById('form');
-          const error = document.getElementById('error');
+          let captchaAnswer = 0; // 存储正确的验证码答案
+  
+          const els = {
+              title: document.getElementById('title'),
+              subtitle: document.getElementById('subtitle'),
+              btn: document.getElementById('btn'),
+              switchBtn: document.getElementById('switchBtn'),
+              form: document.getElementById('form'),
+              error: document.getElementById('error'),
+              username: document.getElementById('username'),
+              pwd: document.getElementById('pwd'),
+              pwdConfirm: document.getElementById('pwd-confirm'),
+              captchaInput: document.getElementById('captcha-input'),
+              captchaLabel: document.getElementById('captcha-question'),
+              regFields: document.querySelectorAll('.register-only')
+          };
+  
+          // 生成简单的数学验证码
+          function generateCaptcha() {
+              const a = Math.floor(Math.random() * 10) + 1; // 1-10
+              const b = Math.floor(Math.random() * 10) + 1; // 1-10
+              captchaAnswer = a + b;
+              els.captchaLabel.innerText = \`\${a} + \${b} = ?\`;
+              els.captchaInput.value = '';
+          }
   
           function toggleMode() {
               isLogin = !isLogin;
-              error.style.display = 'none';
+              els.error.style.display = 'none';
+              
               if (isLogin) {
-                  title.innerText = 'Welcome';
-                  subtitle.innerText = '登录您的个人账本';
-                  btn.innerText = '立即登录';
-                  switchBtn.innerText = '没有账号？点击注册';
-                  document.getElementById('username').focus();
+                  // 切换到登录模式
+                  els.title.innerText = 'Welcome';
+                  els.subtitle.innerText = '登录您的个人账本';
+                  els.btn.innerText = '立即登录';
+                  els.switchBtn.innerText = '没有账号？点击注册';
+                  els.regFields.forEach(el => el.style.display = 'none');
+                  
+                  // 清空注册字段防止干扰
+                  els.pwdConfirm.value = '';
+                  els.captchaInput.value = '';
               } else {
-                  title.innerText = 'Join Aurora';
-                  subtitle.innerText = '创建一个新的账本';
-                  btn.innerText = '注册并登录';
-                  switchBtn.innerText = '已有账号？返回登录';
-                  document.getElementById('username').focus();
+                  // 切换到注册模式
+                  els.title.innerText = 'Join Aurora';
+                  els.subtitle.innerText = '创建一个新的账本';
+                  els.btn.innerText = '注册并登录';
+                  els.switchBtn.innerText = '已有账号？返回登录';
+                  els.regFields.forEach(el => el.style.display = 'block');
+                  
+                  // 生成验证码
+                  generateCaptcha();
               }
+              els.username.focus();
           }
   
-          form.onsubmit = async (e) => {
+          els.form.onsubmit = async (e) => {
               e.preventDefault();
-              error.style.display = 'none';
-              const originalText = btn.innerText;
-              btn.innerText = '处理中...';
-              btn.disabled = true;
+              els.error.style.display = 'none';
               
-              const username = document.getElementById('username').value.trim();
-              const password = document.getElementById('pwd').value;
+              const username = els.username.value.trim();
+              const password = els.pwd.value;
+  
+              // --- 前端验证逻辑 ---
+              if (!isLogin) {
+                  // 1. 验证两次密码是否一致
+                  const confirm = els.pwdConfirm.value;
+                  if (password !== confirm) {
+                      showError('两次输入的密码不一致');
+                      els.pwdConfirm.focus();
+                      return;
+                  }
+  
+                  // 2. 验证数学题
+                  const userAnswer = parseInt(els.captchaInput.value);
+                  if (isNaN(userAnswer) || userAnswer !== captchaAnswer) {
+                      showError('验证码计算错误，请重试');
+                      generateCaptcha(); // 输错刷新题目
+                      els.captchaInput.focus();
+                      return;
+                  }
+              }
+              // ------------------
+  
+              const originalText = els.btn.innerText;
+              els.btn.innerText = '处理中...';
+              els.btn.disabled = true;
+              
               const endpoint = isLogin ? '/api/auth/login' : '/api/auth/register';
   
               try {
@@ -686,11 +832,11 @@ export default {
                   
                   if (res.ok) {
                       if (isLogin) {
-                          btn.innerText = '验证成功';
+                          els.btn.innerText = '验证成功';
                           window.location.href = '/'; 
                       } else {
+                          els.btn.innerText = '注册成功，登录中...';
                           // 注册成功后自动登录
-                          btn.innerText = '注册成功，登录中...';
                           const loginRes = await fetch('/api/auth/login', {
                               method: 'POST',
                               headers: { 'Content-Type': 'application/json' },
@@ -703,9 +849,21 @@ export default {
                       throw new Error(data.error || (isLogin ? '登录失败' : '注册失败')); 
                   }
               } catch (e) { 
-                  error.innerText = e.message; error.style.display = 'block'; 
-                  btn.innerText = originalText; btn.disabled = false; 
+                  showError(e.message);
+                  els.btn.innerText = originalText; 
+                  els.btn.disabled = false; 
+                  // 如果是注册失败，刷新验证码
+                  if (!isLogin) generateCaptcha();
               }
+          }
+  
+          function showError(msg) {
+              els.error.innerText = msg;
+              els.error.style.display = 'block';
+              // 简单的震动反馈
+              els.error.style.animation = 'none';
+              els.error.offsetHeight; /* trigger reflow */
+              els.error.style.animation = 'shake 0.5s cubic-bezier(.36,.07,.19,.97) both';
           }
       </script>
   </body>
@@ -768,6 +926,7 @@ export default {
               margin: 0; font-family: 'Plus Jakarta Sans', -apple-system, sans-serif; 
               background-color: var(--bg); color: var(--text); min-height: 100vh; 
               padding-bottom: calc(90px + var(--safe-bottom)); 
+              /* 默认深色极光背景 */
               background-image: 
                   radial-gradient(circle at 15% 10%, rgba(99, 102, 241, 0.18), transparent 45%), 
                   radial-gradient(circle at 85% 30%, rgba(236, 72, 153, 0.15), transparent 45%),
@@ -777,10 +936,12 @@ export default {
               transition: background-color 0.4s ease, color 0.4s ease;
           }
   
+          /* 亮色模式下去除背景图，保持干净 */
           [data-theme="light"] body {
               background-image: none;
           }
   
+          /* 通用毛玻璃类 */
           .glass {
               background: var(--card-glass);
               backdrop-filter: blur(20px) saturate(180%);
@@ -788,6 +949,7 @@ export default {
               border: 1px solid var(--border-glass);
           }
   
+          /* 亮色模式下卡片不使用毛玻璃，而是实体白+阴影 */
           [data-theme="light"] .glass {
               backdrop-filter: none;
               box-shadow: 0 10px 30px -10px rgba(0,0,0,0.08);
@@ -832,6 +994,7 @@ export default {
               transition: background 0.4s, box-shadow 0.4s;
           }
           
+          /* 卡片光泽 */
           .summary-card::before {
               content: ''; position: absolute; inset: 0;
               background: linear-gradient(120deg, rgba(255,255,255,0.03) 0%, transparent 40%, rgba(255,255,255,0.03) 60%);
@@ -888,6 +1051,7 @@ export default {
           
           .list-group { margin-bottom: 24px; }
           
+          /* 粘性标题 */
           .list-date-header { 
               font-size: 12px; color: var(--text-muted); font-weight: 700; 
               padding: 8px 16px; border-radius: 16px; 
@@ -906,12 +1070,13 @@ export default {
           .list-group.collapsed .group-items { max-height: 0; opacity: 0; margin: 0; }
           
           .t-item { 
-              margin-bottom: 8px; border-radius: 24px;
-              background: var(--list-bg);
+              margin-bottom: 8px; border-radius: 24px; /* 压缩间距 */
+              background: var(--list-bg); /* 垃圾桶背景色 */
               overflow: hidden; 
               box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); 
               position: relative; 
           }
+          /* 垃圾桶图标 */
           .t-item::before {
               content: '🗑️'; font-size: 20px;
               position: absolute; right: 24px; top: 50%; transform: translateY(-50%);
@@ -922,7 +1087,7 @@ export default {
               position: relative; z-index: 2; width: 100%; 
               background: var(--t-content-bg); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
               border: 1px solid var(--border-glass); border-radius: 24px; 
-              padding: 10px 14px;
+              padding: 10px 14px; /* 减小内边距 */
               display: flex; align-items: center; 
               transition: transform 0.2s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.2s; 
           }
@@ -931,12 +1096,12 @@ export default {
           [data-theme="light"] .t-content:active { background: #f1f5f9; }
           
           .t-icon { 
-              width: 36px; height: 36px;
+              width: 36px; height: 36px; /* 缩小图标尺寸 */
               border-radius: 12px; 
               background: linear-gradient(145deg, rgba(255,255,255,0.08), rgba(255,255,255,0.01)); 
               border: 1px solid rgba(255,255,255,0.06); 
               display: flex; align-items: center; justify-content: center; 
-              font-size: 18px;
+              font-size: 18px; /* 缩小图标字号 */
               margin-right: 12px; flex-shrink: 0; 
               box-shadow: 0 4px 10px rgba(0,0,0,0.1);
           }
@@ -951,6 +1116,7 @@ export default {
           [data-theme="light"] .amt-in { text-shadow: none; }
           .amt-out { color: var(--item-text); }
   
+          /* 底部导航 Dock */
           .dock-container { position: fixed; bottom: 30px; left: 0; right: 0; display: flex; justify-content: center; z-index: 100; padding-bottom: var(--safe-bottom); pointer-events: none; }
           .dock { 
               pointer-events: auto; 
@@ -984,6 +1150,7 @@ export default {
           }
           .add-btn:active { transform: translateY(-24px) scale(0.9); }
           
+          /* Modal Sheets */
           .modal-sheet { 
               position: fixed; bottom: 0; left: 0; right: 0; 
               background: #1e293b; 
@@ -1063,6 +1230,7 @@ export default {
           .btn-delete { background: var(--danger); color: white; box-shadow: 0 8px 20px -6px rgba(251, 113, 133, 0.4); }
           .btn-delete:active { transform: scale(0.95); }
   
+          /* Install Prompt */
           .install-prompt {
               position: fixed; bottom: -200px; left: 24px; right: 24px;
               background: rgba(30, 41, 59, 0.95); backdrop-filter: blur(24px);
@@ -1470,6 +1638,8 @@ export default {
                       const currentY = e.touches[0].clientY;
                       const diffX = currentX - startX; 
                       const diffY = currentY - startY;
+  
+                      // 防误触逻辑：水平移动 > 垂直移动时才触发左滑
                       if (Math.abs(diffX) > Math.abs(diffY) && diffX < 0) {
                            if (diffX > -120) { 
                                content.style.transform = \`translateX(\${diffX}px)\`; 
