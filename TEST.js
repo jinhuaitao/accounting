@@ -566,11 +566,12 @@ export default {
               background: rgba(30, 41, 59, 0.3); 
               backdrop-filter: blur(24px) saturate(180%); -webkit-backdrop-filter: blur(24px) saturate(180%); 
               border: 1px solid rgba(255, 255, 255, 0.1); 
-              padding: 56px 40px; border-radius: 40px; 
+              padding: 48px 40px; border-radius: 40px; 
               width: 85%; max-width: 380px; text-align: center; 
               box-shadow: 0 40px 80px -12px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(255,255,255,0.05); 
               animation: floatIn 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); 
               position: relative; overflow: hidden;
+              transition: height 0.3s ease;
           }
           .card::before {
               content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
@@ -580,15 +581,15 @@ export default {
           .card:hover::before { left: 100%; transition: 0.8s ease-in-out; }
           @keyframes floatIn { from { opacity: 0; transform: translateY(30px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
           
-          .logo-img { width: 88px; height: 88px; margin-bottom: 24px; filter: drop-shadow(0 0 30px rgba(139,92,246,0.4)); border-radius: 24px; transition: transform 0.5s ease; }
+          .logo-img { width: 80px; height: 80px; margin-bottom: 20px; filter: drop-shadow(0 0 30px rgba(139,92,246,0.4)); border-radius: 24px; transition: transform 0.5s ease; }
           .card:hover .logo-img { transform: scale(1.05) rotate(3deg); }
           
-          h1 { margin: 0 0 12px 0; font-size: 32px; font-weight: 800; color: white; letter-spacing: -1px; background: linear-gradient(to right, #fff, #c4b5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-          p { margin: 0 0 40px 0; color: #94a3b8; font-size: 15px; font-weight: 500; }
+          h1 { margin: 0 0 8px 0; font-size: 32px; font-weight: 800; color: white; letter-spacing: -1px; background: linear-gradient(to right, #fff, #c4b5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+          p { margin: 0 0 32px 0; color: #94a3b8; font-size: 15px; font-weight: 500; }
           
-          .input-group { position: relative; margin-bottom: 16px; }
+          .input-group { position: relative; margin-bottom: 16px; transition: all 0.3s ease; }
           input { 
-              width: 100%; padding: 18px 24px; border-radius: 20px; 
+              width: 100%; padding: 16px 24px; border-radius: 20px; 
               border: 1px solid rgba(255,255,255,0.08); 
               background: rgba(0,0,0,0.2); 
               color: white; font-size: 16px; 
@@ -597,6 +598,11 @@ export default {
           }
           input::placeholder { color: #64748b; font-family: 'Plus Jakarta Sans', sans-serif; letter-spacing: normal; }
           input:focus { border-color: rgba(139, 92, 246, 0.5); background: rgba(0,0,0,0.4); box-shadow: 0 0 0 4px rgba(139,92,246,0.15); transform: translateY(-2px); }
+          
+          /* 验证码样式 */
+          .captcha-row { display: flex; align-items: center; justify-content: center; gap: 12px; }
+          .captcha-label { color: white; font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 700; min-width: 80px; text-align: right; }
+          #captcha-input { width: 120px; text-align: center; padding-left: 10px; padding-right: 10px; }
           
           button { 
               width: 100%; padding: 18px; border-radius: 20px; border: none; margin-top: 10px;
@@ -617,6 +623,9 @@ export default {
           
           .error { color: #f43f5e; font-size: 14px; margin-bottom: 20px; display: none; background: rgba(244,63,94,0.15); padding: 12px; border-radius: 16px; animation: shake 0.5s cubic-bezier(.36,.07,.19,.97) both; }
           @keyframes shake { 10%, 90% { transform: translate3d(-1px, 0, 0); } 20%, 80% { transform: translate3d(2px, 0, 0); } 30%, 50%, 70% { transform: translate3d(-4px, 0, 0); } 40%, 60% { transform: translate3d(4px, 0, 0); } }
+          
+          /* 隐藏注册专用字段 */
+          .register-only { display: none; }
       </style>
   </head>
   <body>
@@ -626,6 +635,7 @@ export default {
           <h1 id="title">Welcome</h1>
           <p id="subtitle">登录您的个人账本</p>
           <div id="error" class="error"></div>
+          
           <form id="form">
               <div class="input-group">
                   <input type="text" id="username" placeholder="用户名" required autocomplete="username">
@@ -633,46 +643,113 @@ export default {
               <div class="input-group">
                   <input type="password" id="pwd" placeholder="密码" required autocomplete="current-password">
               </div>
+              
+              <div class="input-group register-only" id="group-confirm">
+                  <input type="password" id="pwd-confirm" placeholder="再次输入密码" autocomplete="new-password">
+              </div>
+              
+              <div class="input-group register-only" id="group-captcha">
+                  <div class="captcha-row">
+                      <div class="captcha-label" id="captcha-question">1+1=?</div>
+                      <input type="number" id="captcha-input" placeholder="计算结果" inputmode="numeric">
+                  </div>
+              </div>
+  
               <button type="submit" id="btn">立即登录</button>
           </form>
+          
           <div class="switch-mode" id="switchBtn" onclick="toggleMode()">没有账号？点击注册</div>
       </div>
+  
       <script>
           let isLogin = true;
-          const title = document.getElementById('title');
-          const subtitle = document.getElementById('subtitle');
-          const btn = document.getElementById('btn');
-          const switchBtn = document.getElementById('switchBtn');
-          const form = document.getElementById('form');
-          const error = document.getElementById('error');
+          let captchaAnswer = 0; // 存储正确的验证码答案
+  
+          const els = {
+              title: document.getElementById('title'),
+              subtitle: document.getElementById('subtitle'),
+              btn: document.getElementById('btn'),
+              switchBtn: document.getElementById('switchBtn'),
+              form: document.getElementById('form'),
+              error: document.getElementById('error'),
+              username: document.getElementById('username'),
+              pwd: document.getElementById('pwd'),
+              pwdConfirm: document.getElementById('pwd-confirm'),
+              captchaInput: document.getElementById('captcha-input'),
+              captchaLabel: document.getElementById('captcha-question'),
+              regFields: document.querySelectorAll('.register-only')
+          };
+  
+          // 生成简单的数学验证码
+          function generateCaptcha() {
+              const a = Math.floor(Math.random() * 10) + 1; // 1-10
+              const b = Math.floor(Math.random() * 10) + 1; // 1-10
+              captchaAnswer = a + b;
+              els.captchaLabel.innerText = \`\${a} + \${b} = ?\`;
+              els.captchaInput.value = '';
+          }
   
           function toggleMode() {
               isLogin = !isLogin;
-              error.style.display = 'none';
+              els.error.style.display = 'none';
+              
               if (isLogin) {
-                  title.innerText = 'Welcome';
-                  subtitle.innerText = '登录您的个人账本';
-                  btn.innerText = '立即登录';
-                  switchBtn.innerText = '没有账号？点击注册';
-                  document.getElementById('username').focus();
+                  // 切换到登录模式
+                  els.title.innerText = 'Welcome';
+                  els.subtitle.innerText = '登录您的个人账本';
+                  els.btn.innerText = '立即登录';
+                  els.switchBtn.innerText = '没有账号？点击注册';
+                  els.regFields.forEach(el => el.style.display = 'none');
+                  
+                  // 清空注册字段防止干扰
+                  els.pwdConfirm.value = '';
+                  els.captchaInput.value = '';
               } else {
-                  title.innerText = 'Join Aurora';
-                  subtitle.innerText = '创建一个新的账本';
-                  btn.innerText = '注册并登录';
-                  switchBtn.innerText = '已有账号？返回登录';
-                  document.getElementById('username').focus();
+                  // 切换到注册模式
+                  els.title.innerText = 'Join Aurora';
+                  els.subtitle.innerText = '创建一个新的账本';
+                  els.btn.innerText = '注册并登录';
+                  els.switchBtn.innerText = '已有账号？返回登录';
+                  els.regFields.forEach(el => el.style.display = 'block');
+                  
+                  // 生成验证码
+                  generateCaptcha();
               }
+              els.username.focus();
           }
   
-          form.onsubmit = async (e) => {
+          els.form.onsubmit = async (e) => {
               e.preventDefault();
-              error.style.display = 'none';
-              const originalText = btn.innerText;
-              btn.innerText = '处理中...';
-              btn.disabled = true;
+              els.error.style.display = 'none';
               
-              const username = document.getElementById('username').value.trim();
-              const password = document.getElementById('pwd').value;
+              const username = els.username.value.trim();
+              const password = els.pwd.value;
+  
+              // --- 前端验证逻辑 ---
+              if (!isLogin) {
+                  // 1. 验证两次密码是否一致
+                  const confirm = els.pwdConfirm.value;
+                  if (password !== confirm) {
+                      showError('两次输入的密码不一致');
+                      els.pwdConfirm.focus();
+                      return;
+                  }
+  
+                  // 2. 验证数学题
+                  const userAnswer = parseInt(els.captchaInput.value);
+                  if (isNaN(userAnswer) || userAnswer !== captchaAnswer) {
+                      showError('验证码计算错误，请重试');
+                      generateCaptcha(); // 输错刷新题目
+                      els.captchaInput.focus();
+                      return;
+                  }
+              }
+              // ------------------
+  
+              const originalText = els.btn.innerText;
+              els.btn.innerText = '处理中...';
+              els.btn.disabled = true;
+              
               const endpoint = isLogin ? '/api/auth/login' : '/api/auth/register';
   
               try {
@@ -686,11 +763,11 @@ export default {
                   
                   if (res.ok) {
                       if (isLogin) {
-                          btn.innerText = '验证成功';
+                          els.btn.innerText = '验证成功';
                           window.location.href = '/'; 
                       } else {
+                          els.btn.innerText = '注册成功，登录中...';
                           // 注册成功后自动登录
-                          btn.innerText = '注册成功，登录中...';
                           const loginRes = await fetch('/api/auth/login', {
                               method: 'POST',
                               headers: { 'Content-Type': 'application/json' },
@@ -703,9 +780,21 @@ export default {
                       throw new Error(data.error || (isLogin ? '登录失败' : '注册失败')); 
                   }
               } catch (e) { 
-                  error.innerText = e.message; error.style.display = 'block'; 
-                  btn.innerText = originalText; btn.disabled = false; 
+                  showError(e.message);
+                  els.btn.innerText = originalText; 
+                  els.btn.disabled = false; 
+                  // 如果是注册失败，刷新验证码
+                  if (!isLogin) generateCaptcha();
               }
+          }
+  
+          function showError(msg) {
+              els.error.innerText = msg;
+              els.error.style.display = 'block';
+              // 简单的震动反馈
+              els.error.style.animation = 'none';
+              els.error.offsetHeight; /* trigger reflow */
+              els.error.style.animation = 'shake 0.5s cubic-bezier(.36,.07,.19,.97) both';
           }
       </script>
   </body>
@@ -1063,6 +1152,7 @@ export default {
           .btn-delete { background: var(--danger); color: white; box-shadow: 0 8px 20px -6px rgba(251, 113, 133, 0.4); }
           .btn-delete:active { transform: scale(0.95); }
   
+          /* Install Prompt */
           .install-prompt {
               position: fixed; bottom: -200px; left: 24px; right: 24px;
               background: rgba(30, 41, 59, 0.95); backdrop-filter: blur(24px);
