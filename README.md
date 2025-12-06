@@ -41,7 +41,7 @@
    - **KV namespace**: 选择刚才创建的 `ACCOUNTING_KV` 命名空间
 7. 点击 **"Save"**
 
-### 第六步：配置 R2 绑定
+### 第五步：配置 R2 绑定
 
 创建 R2 存储桶：创建一个新的 Bucket（例如命名为 aurora-ledger）。
 绑定 R2 到 Worker：
@@ -51,19 +51,33 @@
 
 ### 第六步：上传代码
 
+Cloudflare Turnstile 验证的具体指南。
+
+这一修改涉及前端（显示验证码）和后端（验证 Token）两个部分。
+
+准备工作
+在开始代码修改前，请前往 Cloudflare Dashboard > Turnstile：
+创建一个新的 Widget。
+获取 Site Key (用于前端 HTML)。
+获取 Secret Key (用于后端 Worker 验证)。
+在 Worker 的设置 (Settings) > 变量 (Variables) 中，添加一个名为 TURNSTILE_SECRET 的环境变量，填入你的 Secret Key。
+修改第742行里找到 data-sitekey="REPLACE_WITH_YOUR_SITE_KEY"，将其替换为你自己的 Site Key
+
+### 第七步：上传代码
+
 1. 点击 **"Quick edit"** 或返回 Worker 主页面点击 **"Edit code"**
 2. 删除默认的代码（类似 `export default { ... }` 的内容）
 3. 复制我们项目中的 `index.js` 文件的全部内容
 4. 粘贴到编辑器中
 5. 点击 **"Save and Deploy"**
 
-### 第七步：设置密码（可选）
+### 第八步：设置密码（可选）
 
 1. 部署后，访问你的应用 URL
 2. 注册账号和密码
 3. 登录
 
-### 第八步：测试应用
+### 第九步：测试应用
 
 1. 部署成功后，你会看到一个 Workers URL，类似：
    ```
