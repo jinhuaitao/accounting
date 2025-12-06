@@ -16,6 +16,8 @@
 3. 选择 **"Create Worker"**
 4. 输入应用名称，例如：`accounting-app`
 5. 点击 **"Deploy"**
+6. Cloudflare KV (ACCOUNTING_KV)：专门用于存储用户会话 (Session) 和系统配置（如密码）。KV 的读取速度极快，非常适合高频的权限验证。
+7. Cloudflare R2 (ACCOUNTING_BUCKET)：专门用于存储账单数据 (JSON)。R2 成本更低，且更适合存储“文件”性质的数据。
 
 ### 第三步：创建 KV 命名空间
 
@@ -39,7 +41,15 @@
    - **KV namespace**: 选择刚才创建的 `ACCOUNTING_KV` 命名空间
 7. 点击 **"Save"**
 
-### 第五步：上传代码
+### 第六步：配置 R2 绑定
+
+创建 R2 存储桶：创建一个新的 Bucket（例如命名为 aurora-ledger）。
+绑定 R2 到 Worker：
+进入 Worker 的 Settings -> Variables -> R2 Bucket Bindings。
+变量名 (Variable name) 填写：ACCOUNTING_BUCKET (必须完全一致)。
+选择您刚才创建的 Bucket。
+
+### 第六步：上传代码
 
 1. 点击 **"Quick edit"** 或返回 Worker 主页面点击 **"Edit code"**
 2. 删除默认的代码（类似 `export default { ... }` 的内容）
@@ -47,7 +57,7 @@
 4. 粘贴到编辑器中
 5. 点击 **"Save and Deploy"**
 
-### 第六步：设置密码（可选）
+### 第七步：设置密码（可选）
 
 1. 部署后，访问你的应用 URL
 2. 应用会显示登录页面
@@ -59,7 +69,7 @@
    - 在 KV 命名空间中添加 key: `app_password`
    - 设置你的自定义密码作为 value
 
-### 第七步：测试应用
+### 第八步：测试应用
 
 1. 部署成功后，你会看到一个 Workers URL，类似：
    ```
