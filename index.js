@@ -16,8 +16,9 @@ export default {
       }
   
       try {
-        // 鉴权逻辑 (依赖 KV)
-        if (path !== '/login' && !path.startsWith('/api/auth')) {
+        // --- 路由守卫 ---
+        // 排除登录页、Auth API、静态资源
+        if (path !== '/login' && !path.startsWith('/api/auth') && path !== '/manifest.json' && path !== '/sw.js') {
           const isAuthenticated = await checkAuthentication(request, env);
           if (!isAuthenticated) {
             return new Response(getLoginPageHTML(), {
@@ -79,9 +80,7 @@ export default {
     },
   };
   
-  // --- 核心逻辑 ---
-  
-  // 鉴权仍然使用 KV
+  // --- 鉴权辅助函数 ---
   async function checkAuthentication(request, env) {
     const cookieHeader = request.headers.get('Cookie') || '';
     const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
@@ -96,15 +95,33 @@ export default {
     return false;
   }
   
-  // --- 关键修改：智能读取函数 (含自动迁移) ---
+  // 获取当前请求的用户信息 (用于数据隔离)
+  async function getCurrentUser(request, env) {
+    const kv = env.ACCOUNTING_KV;
+    const cookieHeader = request.headers.get('Cookie') || '';
+    const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
+      const [name, value] = cookie.trim().split('=');
+      acc[name] = value;
+      return acc;
+    }, {});
+  
+    if (cookies.auth_token) {
+      const sessionStr = await kv.get(`session_${cookies.auth_token}`);
+      if (sessionStr) {
+        return JSON.parse(sessionStr); // 返回 { userId, username, ... }
+      }
+    }
+    return null;
+  }
+  
+  // --- R2 数据存取逻辑 ---
   async function getTransactionsFromR2(env, userId) {
       const r2Key = `transactions_${userId}.json`;
       
-      // 1. 优先尝试从 R2 读取
+      // 尝试从 R2 读取
       const object = await env.ACCOUNTING_BUCKET.get(r2Key);
       
       if (object !== null) {
-          // R2 有数据，直接返回
           try {
               return await object.json();
           } catch (e) {
@@ -113,51 +130,77 @@ export default {
           }
       }
   
-      // 2. R2 是空的？检查 KV 是否有旧数据 (自动迁移逻辑)
-      const kvKey = `transactions_${userId}`;
-      const oldData = await env.ACCOUNTING_KV.get(kvKey, 'json');
-      
-      if (oldData && Array.isArray(oldData) && oldData.length > 0) {
-          // 发现 KV 有数据！立刻搬运到 R2
-          await env.ACCOUNTING_BUCKET.put(r2Key, JSON.stringify(oldData));
-          return oldData; // 返回旧数据
-      }
-  
-      // 3. 都没有，确实是新用户
+      // 新用户或无数据，返回空数组
       return [];
   }
   
-  // 写入数据到 R2
   async function saveTransactionsToR2(env, userId, data) {
       const key = `transactions_${userId}.json`;
       await env.ACCOUNTING_BUCKET.put(key, JSON.stringify(data));
   }
   
+  // --- 核心 API 处理 ---
   async function handleAPIRequest(request, env, path, method) {
     const kv = env.ACCOUNTING_KV; 
-    const userId = 'default_user'; 
   
-    // --- Auth API (KV) ---
-    if (path === '/api/auth/login' && method === 'POST') {
-      const { password } = await request.json();
-      const correctPassword = env.ADMIN_PASSWORD || await kv.get('app_password');
-      
-      if (password === correctPassword) {
-        const token = generateToken();
-        const expiresAt = Date.now() + (24 * 60 * 60 * 1000);
-        await kv.put(`session_${token}`, JSON.stringify({ userId, expiresAt }), { expirationTtl: 86400 });
-        return new Response(JSON.stringify({ success: true, token }), {
-          status: 200,
-          headers: { 
-            'Content-Type': 'application/json',
-            'Set-Cookie': `auth_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`
-          },
+    // 1. 注册接口
+    if (path === '/api/auth/register' && method === 'POST') {
+      try {
+        const { username, password } = await request.json();
+        if (!username || !password) return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400 });
+        
+        // 检查用户是否存在
+        const existingUser = await kv.get(`u_${username}`);
+        if (existingUser) {
+          return new Response(JSON.stringify({ error: '用户名已存在' }), { status: 409 });
+        }
+  
+        // 创建新用户 (生成唯一 userId)
+        const userId = generateToken(); 
+        const userData = { password, userId, createdAt: Date.now() };
+        
+        // 存储用户数据
+        await kv.put(`u_${username}`, JSON.stringify(userData));
+  
+        return new Response(JSON.stringify({ success: true }), { 
+          status: 200, 
+          headers: { 'Content-Type': 'application/json' } 
         });
-      } else {
-        return new Response(JSON.stringify({ error: '密码错误' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 500 });
       }
     }
   
+    // 2. 登录接口 (纯净版：仅支持用户名+密码)
+    if (path === '/api/auth/login' && method === 'POST') {
+      const { username, password } = await request.json();
+      
+      if (!username || !password) {
+        return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+  
+      // 查询 KV 用户
+      const userStr = await kv.get(`u_${username}`);
+      
+      if (userStr) {
+        const userData = JSON.parse(userStr);
+        if (userData.password === password) {
+          const token = generateToken();
+          // Session 存储具体的 userId
+          await kv.put(`session_${token}`, JSON.stringify({ userId: userData.userId, username }), { expirationTtl: 86400 });
+          return new Response(JSON.stringify({ success: true, token }), {
+            status: 200,
+            headers: { 
+              'Content-Type': 'application/json',
+              'Set-Cookie': `auth_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`
+            },
+          });
+        }
+      }
+      return new Response(JSON.stringify({ error: '账号或密码错误' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+    }
+  
+    // 3. 登出
     if (path === '/api/auth/logout' && method === 'POST') {
       const cookieHeader = request.headers.get('Cookie') || '';
       const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
@@ -172,7 +215,14 @@ export default {
       });
     }
   
-    // --- Transaction API (智能 R2) ---
+    // --- 以下所有业务接口，必须获取当前 userId ---
+    const currentUser = await getCurrentUser(request, env);
+    if (!currentUser) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
+    }
+    const userId = currentUser.userId; // 关键：数据隔离核心
+  
+    // --- 账单业务逻辑 ---
     
     if (path === '/api/transactions') {
       if (method === 'GET') {
@@ -195,12 +245,9 @@ export default {
   
     if (path.startsWith('/api/transactions/') && method === 'DELETE') {
       const transactionId = path.split('/').pop();
-      
       const transactions = await getTransactionsFromR2(env, userId);
       const filteredTransactions = transactions.filter(t => t.id !== transactionId);
-      
       await saveTransactionsToR2(env, userId, filteredTransactions);
-      
       return new Response(JSON.stringify(filteredTransactions), { headers: { 'Content-Type': 'application/json' } });
     }
   
@@ -238,7 +285,7 @@ export default {
     return new Response('Not Found', { status: 404 });
   }
   
-  // --- 逻辑函数 (保持不变) ---
+  // --- 数据计算逻辑函数 (保持不变) ---
   function calculateDailyBalances(transactions, targetYear, targetMonth) {
       const monthlyTransactions = transactions.filter(t => {
           const d = new Date(t.timestamp);
@@ -359,7 +406,7 @@ export default {
   
   function getServiceWorker() {
     return `
-  const CACHE_NAME = 'aurora-app-v28';
+  const CACHE_NAME = 'aurora-app-v30';
   const urlsToCache = [
     '/', 
     '/manifest.json',
@@ -495,6 +542,7 @@ export default {
     return { totalIncome: income, totalExpense: expense, balance: income - expense, transactionCount: filtered.length, period };
   }
   
+  // --- 登录/注册页面 (HTML + JS) ---
   function getLoginPageHTML() {
       const iconBase64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48ZGVmcz48bGluZWFyR3JhZGllbnQgaWQ9ImEiIHgxPSIwIiB5MT0iMCIgeDI9IjUxMiIgeTI9IjUxMiIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzYzNjZmMSIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iI2E4NTVmNyIvPjwvbGluZWFyR3JhZGllbnQ+PC9kZWZzPjxyZWN0IHdpZHRoPSI1MTIiIGhlaWdodD0iNTEyIiByeD0iMTI4IiBmaWxsPSJ1cmwoI2EpIi8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTI1NiAxMjhsLTMyIDgwSDEyOGw4MCAzMi04MCAzMmg5NmwzMiA4MEwyNTYgNDAwTDI4OCAyNTZoOTZsMzItODBoLTk2ek0yNTYgMTkybDMyIDgwaDk2bDMyLTgwaC05NnoiLz48L3N2Zz4=";
       return `<!DOCTYPE html>
@@ -524,37 +572,34 @@ export default {
               animation: floatIn 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); 
               position: relative; overflow: hidden;
           }
-          
-          /* Shine effect */
           .card::before {
               content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
               background: linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent);
               transition: 0.5s; pointer-events: none;
           }
           .card:hover::before { left: 100%; transition: 0.8s ease-in-out; }
-  
           @keyframes floatIn { from { opacity: 0; transform: translateY(30px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
           
-          .logo-img { width: 88px; height: 88px; margin-bottom: 32px; filter: drop-shadow(0 0 30px rgba(139,92,246,0.4)); border-radius: 24px; transition: transform 0.5s ease; }
+          .logo-img { width: 88px; height: 88px; margin-bottom: 24px; filter: drop-shadow(0 0 30px rgba(139,92,246,0.4)); border-radius: 24px; transition: transform 0.5s ease; }
           .card:hover .logo-img { transform: scale(1.05) rotate(3deg); }
           
           h1 { margin: 0 0 12px 0; font-size: 32px; font-weight: 800; color: white; letter-spacing: -1px; background: linear-gradient(to right, #fff, #c4b5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-          p { margin: 0 0 48px 0; color: #94a3b8; font-size: 15px; font-weight: 500; }
+          p { margin: 0 0 40px 0; color: #94a3b8; font-size: 15px; font-weight: 500; }
           
-          .input-group { position: relative; margin-bottom: 24px; }
+          .input-group { position: relative; margin-bottom: 16px; }
           input { 
-              width: 100%; padding: 20px 24px; border-radius: 24px; 
+              width: 100%; padding: 18px 24px; border-radius: 20px; 
               border: 1px solid rgba(255,255,255,0.08); 
               background: rgba(0,0,0,0.2); 
-              color: white; font-size: 18px; letter-spacing: 4px; 
-              outline: none; text-align: center; transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1); 
+              color: white; font-size: 16px; 
+              outline: none; text-align: left; transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1); 
               box-sizing: border-box; font-family: 'Plus Jakarta Sans', monospace; 
           }
-          input::placeholder { font-size: 16px; letter-spacing: normal; opacity: 0.4; font-family: 'Plus Jakarta Sans', sans-serif; }
+          input::placeholder { color: #64748b; font-family: 'Plus Jakarta Sans', sans-serif; letter-spacing: normal; }
           input:focus { border-color: rgba(139, 92, 246, 0.5); background: rgba(0,0,0,0.4); box-shadow: 0 0 0 4px rgba(139,92,246,0.15); transform: translateY(-2px); }
           
           button { 
-              width: 100%; padding: 20px; border-radius: 24px; border: none; 
+              width: 100%; padding: 18px; border-radius: 20px; border: none; margin-top: 10px;
               background: linear-gradient(135deg, #6366f1, #a855f7, #ec4899); 
               background-size: 200% 200%;
               animation: gradient-anim 5s ease infinite;
@@ -563,12 +608,14 @@ export default {
               box-shadow: 0 10px 25px -10px rgba(99, 102, 241, 0.6); 
           }
           @keyframes gradient-anim { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
-          
           button:hover { transform: translateY(-3px); box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.7); }
           button:active { transform: scale(0.97); }
           button:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
           
-          .error { color: #f43f5e; font-size: 14px; margin-bottom: 24px; display: none; background: rgba(244,63,94,0.15); padding: 12px; border-radius: 16px; animation: shake 0.5s cubic-bezier(.36,.07,.19,.97) both; }
+          .switch-mode { margin-top: 24px; font-size: 14px; color: #94a3b8; cursor: pointer; transition: 0.3s; }
+          .switch-mode:hover { color: white; text-decoration: underline; }
+          
+          .error { color: #f43f5e; font-size: 14px; margin-bottom: 20px; display: none; background: rgba(244,63,94,0.15); padding: 12px; border-radius: 16px; animation: shake 0.5s cubic-bezier(.36,.07,.19,.97) both; }
           @keyframes shake { 10%, 90% { transform: translate3d(-1px, 0, 0); } 20%, 80% { transform: translate3d(2px, 0, 0); } 30%, 50%, 70% { transform: translate3d(-4px, 0, 0); } 40%, 60% { transform: translate3d(4px, 0, 0); } }
       </style>
   </head>
@@ -576,39 +623,88 @@ export default {
       <div class="aurora-bg"></div>
       <div class="card">
           <img src="${iconBase64}" class="logo-img" alt="Logo">
-          <h1>Welcome Back</h1>
-          <p>安全访问您的个人账本</p>
+          <h1 id="title">Welcome</h1>
+          <p id="subtitle">登录您的个人账本</p>
           <div id="error" class="error"></div>
           <form id="form">
               <div class="input-group">
-                  <input type="password" id="pwd" placeholder="输入密码" required>
+                  <input type="text" id="username" placeholder="用户名" required autocomplete="username">
               </div>
-              <button type="submit" id="btn">解锁进入</button>
+              <div class="input-group">
+                  <input type="password" id="pwd" placeholder="密码" required autocomplete="current-password">
+              </div>
+              <button type="submit" id="btn">立即登录</button>
           </form>
+          <div class="switch-mode" id="switchBtn" onclick="toggleMode()">没有账号？点击注册</div>
       </div>
       <script>
-          document.getElementById('form').onsubmit = async (e) => {
+          let isLogin = true;
+          const title = document.getElementById('title');
+          const subtitle = document.getElementById('subtitle');
+          const btn = document.getElementById('btn');
+          const switchBtn = document.getElementById('switchBtn');
+          const form = document.getElementById('form');
+          const error = document.getElementById('error');
+  
+          function toggleMode() {
+              isLogin = !isLogin;
+              error.style.display = 'none';
+              if (isLogin) {
+                  title.innerText = 'Welcome';
+                  subtitle.innerText = '登录您的个人账本';
+                  btn.innerText = '立即登录';
+                  switchBtn.innerText = '没有账号？点击注册';
+                  document.getElementById('username').focus();
+              } else {
+                  title.innerText = 'Join Aurora';
+                  subtitle.innerText = '创建一个新的账本';
+                  btn.innerText = '注册并登录';
+                  switchBtn.innerText = '已有账号？返回登录';
+                  document.getElementById('username').focus();
+              }
+          }
+  
+          form.onsubmit = async (e) => {
               e.preventDefault();
-              const btn = document.getElementById('btn');
-              const err = document.getElementById('error');
-              err.style.display = 'none';
+              error.style.display = 'none';
               const originalText = btn.innerText;
-              btn.innerText = '验证中...';
+              btn.innerText = '处理中...';
               btn.disabled = true;
+              
+              const username = document.getElementById('username').value.trim();
+              const password = document.getElementById('pwd').value;
+              const endpoint = isLogin ? '/api/auth/login' : '/api/auth/register';
+  
               try {
-                  const res = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: document.getElementById('pwd').value }) });
-                  if (res.ok) { 
-                      btn.innerText = '验证成功';
-                      window.location.href = '/'; 
+                  const res = await fetch(endpoint, { 
+                      method: 'POST', 
+                      headers: { 'Content-Type': 'application/json' }, 
+                      body: JSON.stringify({ username, password }) 
+                  });
+                  
+                  const data = await res.json();
+                  
+                  if (res.ok) {
+                      if (isLogin) {
+                          btn.innerText = '验证成功';
+                          window.location.href = '/'; 
+                      } else {
+                          // 注册成功后自动登录
+                          btn.innerText = '注册成功，登录中...';
+                          const loginRes = await fetch('/api/auth/login', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ username, password })
+                          });
+                          if (loginRes.ok) window.location.href = '/';
+                          else throw new Error('自动登录失败，请手动登录');
+                      }
                   } else { 
-                      const data = await res.json(); 
-                      throw new Error(data.error || '登录失败'); 
+                      throw new Error(data.error || (isLogin ? '登录失败' : '注册失败')); 
                   }
               } catch (e) { 
-                  err.innerText = e.message; err.style.display = 'block'; 
+                  error.innerText = e.message; error.style.display = 'block'; 
                   btn.innerText = originalText; btn.disabled = false; 
-                  document.getElementById('pwd').value = '';
-                  document.getElementById('pwd').focus();
               }
           }
       </script>
@@ -672,7 +768,6 @@ export default {
               margin: 0; font-family: 'Plus Jakarta Sans', -apple-system, sans-serif; 
               background-color: var(--bg); color: var(--text); min-height: 100vh; 
               padding-bottom: calc(90px + var(--safe-bottom)); 
-              /* 默认深色极光背景 */
               background-image: 
                   radial-gradient(circle at 15% 10%, rgba(99, 102, 241, 0.18), transparent 45%), 
                   radial-gradient(circle at 85% 30%, rgba(236, 72, 153, 0.15), transparent 45%),
@@ -682,12 +777,10 @@ export default {
               transition: background-color 0.4s ease, color 0.4s ease;
           }
   
-          /* 亮色模式下去除背景图，保持干净 */
           [data-theme="light"] body {
               background-image: none;
           }
   
-          /* 通用毛玻璃类 */
           .glass {
               background: var(--card-glass);
               backdrop-filter: blur(20px) saturate(180%);
@@ -695,7 +788,6 @@ export default {
               border: 1px solid var(--border-glass);
           }
   
-          /* 亮色模式下卡片不使用毛玻璃，而是实体白+阴影 */
           [data-theme="light"] .glass {
               backdrop-filter: none;
               box-shadow: 0 10px 30px -10px rgba(0,0,0,0.08);
@@ -740,7 +832,6 @@ export default {
               transition: background 0.4s, box-shadow 0.4s;
           }
           
-          /* 卡片光泽 */
           .summary-card::before {
               content: ''; position: absolute; inset: 0;
               background: linear-gradient(120deg, rgba(255,255,255,0.03) 0%, transparent 40%, rgba(255,255,255,0.03) 60%);
@@ -797,7 +888,6 @@ export default {
           
           .list-group { margin-bottom: 24px; }
           
-          /* 粘性标题 */
           .list-date-header { 
               font-size: 12px; color: var(--text-muted); font-weight: 700; 
               padding: 8px 16px; border-radius: 16px; 
@@ -816,13 +906,12 @@ export default {
           .list-group.collapsed .group-items { max-height: 0; opacity: 0; margin: 0; }
           
           .t-item { 
-              margin-bottom: 8px; border-radius: 24px; /* 压缩间距 */
-              background: var(--list-bg); /* 垃圾桶背景色 */
+              margin-bottom: 8px; border-radius: 24px;
+              background: var(--list-bg);
               overflow: hidden; 
               box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); 
               position: relative; 
           }
-          /* 垃圾桶图标 */
           .t-item::before {
               content: '🗑️'; font-size: 20px;
               position: absolute; right: 24px; top: 50%; transform: translateY(-50%);
@@ -833,7 +922,7 @@ export default {
               position: relative; z-index: 2; width: 100%; 
               background: var(--t-content-bg); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
               border: 1px solid var(--border-glass); border-radius: 24px; 
-              padding: 10px 14px; /* 减小内边距 */
+              padding: 10px 14px;
               display: flex; align-items: center; 
               transition: transform 0.2s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.2s; 
           }
@@ -842,12 +931,12 @@ export default {
           [data-theme="light"] .t-content:active { background: #f1f5f9; }
           
           .t-icon { 
-              width: 36px; height: 36px; /* 缩小图标尺寸 */
+              width: 36px; height: 36px;
               border-radius: 12px; 
               background: linear-gradient(145deg, rgba(255,255,255,0.08), rgba(255,255,255,0.01)); 
               border: 1px solid rgba(255,255,255,0.06); 
               display: flex; align-items: center; justify-content: center; 
-              font-size: 18px; /* 缩小图标字号 */
+              font-size: 18px;
               margin-right: 12px; flex-shrink: 0; 
               box-shadow: 0 4px 10px rgba(0,0,0,0.1);
           }
@@ -862,7 +951,6 @@ export default {
           [data-theme="light"] .amt-in { text-shadow: none; }
           .amt-out { color: var(--item-text); }
   
-          /* 底部导航 Dock */
           .dock-container { position: fixed; bottom: 30px; left: 0; right: 0; display: flex; justify-content: center; z-index: 100; padding-bottom: var(--safe-bottom); pointer-events: none; }
           .dock { 
               pointer-events: auto; 
@@ -896,7 +984,6 @@ export default {
           }
           .add-btn:active { transform: translateY(-24px) scale(0.9); }
           
-          /* Modal Sheets */
           .modal-sheet { 
               position: fixed; bottom: 0; left: 0; right: 0; 
               background: #1e293b; 
@@ -976,7 +1063,6 @@ export default {
           .btn-delete { background: var(--danger); color: white; box-shadow: 0 8px 20px -6px rgba(251, 113, 133, 0.4); }
           .btn-delete:active { transform: scale(0.95); }
   
-          /* Install Prompt */
           .install-prompt {
               position: fixed; bottom: -200px; left: 24px; right: 24px;
               background: rgba(30, 41, 59, 0.95); backdrop-filter: blur(24px);
@@ -1146,7 +1232,6 @@ export default {
               }
           });
   
-          // 主题切换逻辑
           function initTheme() {
               const savedTheme = localStorage.getItem('app_theme');
               if (savedTheme === 'light') {
@@ -1169,7 +1254,7 @@ export default {
                   localStorage.setItem('app_theme', 'light');
                   btn.textContent = '🌙';
               }
-              if (state.chartInstance) refreshChart(); // 刷新图表以适应新颜色
+              if (state.chartInstance) refreshChart(); 
           }
           window.toggleTheme = toggleTheme;
           
@@ -1249,7 +1334,6 @@ export default {
               document.querySelectorAll('.nav-item').forEach(t => t.classList.remove('active')); 
               if (el) el.classList.add('active'); 
               
-              // --- 控制列表显示/隐藏逻辑 ---
               const listHeader = document.querySelector('.list-header-row');
               const listContainer = document.getElementById('list');
               
@@ -1287,7 +1371,6 @@ export default {
                const ctx = document.getElementById('dailyBalanceChart').getContext('2d');
                if (state.chartInstance) { state.chartInstance.destroy(); }
                
-               // 更高级的渐变色
                const gradientInc = ctx.createLinearGradient(0, 0, 0, 200); 
                gradientInc.addColorStop(0, '#34d399'); gradientInc.addColorStop(1, 'rgba(52, 211, 153, 0.2)');
                
@@ -1302,9 +1385,9 @@ export default {
                            label: '净流量', 
                            data: data.map(d => d.value), 
                            backgroundColor: data.map(d => d.value >= 0 ? gradientInc : gradientExp), 
-                           borderRadius: 100, // 完全圆角
+                           borderRadius: 100, 
                            borderSkipped: false,
-                           barThickness: 8, // 细长条
+                           barThickness: 8, 
                        }] 
                    }, 
                    options: { 
@@ -1387,8 +1470,6 @@ export default {
                       const currentY = e.touches[0].clientY;
                       const diffX = currentX - startX; 
                       const diffY = currentY - startY;
-  
-                      // 防误触逻辑：水平移动 > 垂直移动时才触发左滑
                       if (Math.abs(diffX) > Math.abs(diffY) && diffX < 0) {
                            if (diffX > -120) { 
                                content.style.transform = \`translateX(\${diffX}px)\`; 
