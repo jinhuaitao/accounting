@@ -201,6 +201,8 @@ index.js
 - 地理分布
 
 这样你就完全通过网页界面成功部署了记账应用！🎉
+## 图片展示
+
 <img width="493" height="668" alt="image" src="https://github.com/user-attachments/assets/a3336108-9d6b-40da-a6ad-0b2f02d52968" />
 <img width="598" height="1095" alt="image" src="https://github.com/user-attachments/assets/dba2be73-464d-492b-8215-f6c9aabd430d" />
 <img width="592" height="1091" alt="image" src="https://github.com/user-attachments/assets/02c03cf5-fa08-4066-acb2-b726e37e03a9" />
