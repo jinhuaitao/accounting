@@ -4,13 +4,13 @@ export default {
       const path = url.pathname;
       const method = request.method;
   
-      // --- 安全响应头 ---
+      // 安全响应头
       const securityHeaders = {
-        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-src https://challenges.cloudflare.com;",
+        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self';",
         'X-Content-Type-Options': 'nosniff',
         'X-Frame-Options': 'DENY',
         'Referrer-Policy': 'strict-origin-when-cross-origin',
-        'Access-Control-Allow-Origin': url.origin,
+        'Access-Control-Allow-Origin': url.origin, // 仅允许同源
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type',
       };
@@ -83,14 +83,15 @@ export default {
     },
   };
   
-  // --- 安全辅助函数 ---
+  // --- 安全辅助函数 (核心修改) ---
   
-  // 1. 密码加盐哈希
+  // 1. 密码加盐哈希 (PBKDF2)
   async function hashPassword(password, salt = null) {
     const enc = new TextEncoder();
     if (!salt) {
-      salt = crypto.getRandomValues(new Uint8Array(16));
+      salt = crypto.getRandomValues(new Uint8Array(16)); // 生成随机盐
     } else {
+      // 恢复盐的格式
       salt = Uint8Array.from(atob(salt), c => c.charCodeAt(0));
     }
     
@@ -103,8 +104,10 @@ export default {
       keyMaterial, { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]
     );
     
+    // 导出 Key 为 Raw 数据用于存储
     const exported = await crypto.subtle.exportKey("raw", key);
     
+    // 返回 base64 格式的 Salt 和 Hash
     const saltStr = btoa(String.fromCharCode(...salt));
     const hashStr = btoa(String.fromCharCode(...new Uint8Array(exported)));
     return { salt: saltStr, hash: hashStr };
@@ -123,31 +126,12 @@ export default {
     return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
   }
   
-  // 4. 输入清洗
+  // 4. 输入清洗 (防止 XSS)
   function sanitize(str) {
     if (typeof str !== 'string') return str;
     return str.replace(/[&<>"'/]/g, (char) => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '/': '&#x2F;'
     }[char]));
-  }
-
-  // 5. Cloudflare Turnstile 验证
-  async function verifyTurnstile(token, secretKey, ip) {
-    if (!secretKey) return false; 
-    const formData = new FormData();
-    formData.append('secret', secretKey);
-    formData.append('response', token);
-    formData.append('remoteip', ip || '');
-  
-    const url = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
-    try {
-        const result = await fetch(url, { body: formData, method: 'POST' });
-        const outcome = await result.json();
-        return outcome.success;
-    } catch (e) {
-        console.error('Turnstile Verify Error:', e);
-        return false;
-    }
   }
   
   // --- 鉴权逻辑 ---
@@ -183,7 +167,7 @@ export default {
     return null;
   }
   
-  // --- R2 逻辑 ---
+  // --- R2 逻辑 (不变) ---
   async function getTransactionsFromR2(env, userId) {
       const r2Key = `transactions_${userId}.json`;
       const object = await env.ACCOUNTING_BUCKET.get(r2Key);
@@ -202,30 +186,24 @@ export default {
   async function handleAPIRequest(request, env, path, method) {
     const kv = env.ACCOUNTING_KV; 
   
-    // --- 1. 注册接口 ---
+    // --- 1. 注册接口 (安全升级) ---
     if (path === '/api/auth/register' && method === 'POST') {
       try {
-        const { username, password, cfToken } = await request.json();
+        const { username, password } = await request.json();
         if (!username || !password) return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400 });
         
-        // Turnstile 验证
-        const ip = request.headers.get('CF-Connecting-IP');
-        const isHuman = await verifyTurnstile(cfToken, env.TURNSTILE_SECRET, ip);
-        if (!isHuman) {
-             return new Response(JSON.stringify({ error: '人机验证失败，请刷新重试' }), { status: 403 });
-        }
-
-        const cleanUsername = sanitize(username); 
+        const cleanUsername = sanitize(username); // 清洗用户名
   
         const existingUser = await kv.get(`u_${cleanUsername}`);
         if (existingUser) return new Response(JSON.stringify({ error: '用户名已存在' }), { status: 409 });
   
+        // **关键修改：密码哈希存储**
         const { salt, hash } = await hashPassword(password);
-        const userId = generateSecureToken();
+        const userId = generateSecureToken(); // 使用安全 UUID
         
         const userData = { 
           salt, 
-          hash, 
+          hash, // 存哈希，不存明文
           userId, 
           createdAt: Date.now() 
         };
@@ -238,23 +216,16 @@ export default {
       }
     }
   
-    // --- 2. 登录接口 (核心修改：添加 Turnstile 验证) ---
+    // --- 2. 登录接口 (安全升级：防爆破 + 哈希比对) ---
     if (path === '/api/auth/login' && method === 'POST') {
-      // 1. 从请求体获取 cfToken
-      const { username, password, cfToken } = await request.json();
+      const { username, password } = await request.json();
       if (!username || !password) return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400 });
   
       const cleanUsername = sanitize(username);
       const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
       const rateLimitKey = `limit_${ip}`;
       
-      // 2. 先验证 Turnstile (阻挡机器人请求)
-      const isHuman = await verifyTurnstile(cfToken, env.TURNSTILE_SECRET, ip);
-      if (!isHuman) {
-           return new Response(JSON.stringify({ error: '验证失败，请刷新验证码' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      // 防暴力破解检测 (保留 IP 频率限制作为第二道防线)
+      // **防暴力破解检测**
       let attempts = parseInt(await kv.get(rateLimitKey) || '0');
       if (attempts >= 5) {
           return new Response(JSON.stringify({ error: '尝试次数过多，请15分钟后再试' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
@@ -264,6 +235,8 @@ export default {
       
       if (userStr) {
         const userData = JSON.parse(userStr);
+        // **关键修改：哈希验证**
+        // 兼容逻辑：如果是旧数据(没有salt)，提示重置。如果是新数据，进行 Verify。
         if (!userData.salt || !userData.hash) {
              return new Response(JSON.stringify({ error: '账号数据需升级，请联系管理员或重新注册' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
         }
@@ -271,11 +244,13 @@ export default {
         const isValid = await verifyPassword(password, userData.salt, userData.hash);
   
         if (isValid) {
+          // 登录成功，清除错误计数
           await kv.delete(rateLimitKey);
   
           const token = generateSecureToken();
           await kv.put(`session_${token}`, JSON.stringify({ userId: userData.userId, username: cleanUsername }), { expirationTtl: 86400 });
           
+          // **Cookie 安全属性**
           return new Response(JSON.stringify({ success: true, token }), {
             status: 200,
             headers: { 
@@ -286,6 +261,7 @@ export default {
         }
       }
       
+      // 登录失败：记录尝试次数 (TTL 15分钟)
       await kv.put(rateLimitKey, (attempts + 1).toString(), { expirationTtl: 900 });
       return new Response(JSON.stringify({ error: '账号或密码错误' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     }
@@ -311,7 +287,7 @@ export default {
     }
     const userId = currentUser.userId;
   
-    // --- 账单业务逻辑 (保持不变) ---
+    // --- 账单业务逻辑 (输入清洗) ---
     
     if (path === '/api/transactions') {
       if (method === 'GET') {
@@ -320,13 +296,15 @@ export default {
       }
       if (method === 'POST') {
         const rawTx = await request.json();
+        
+        // **输入清洗**
         const transaction = {
             id: generateSecureToken(),
             timestamp: new Date().toISOString(),
             type: rawTx.type,
-            amount: parseFloat(rawTx.amount),
-            category: sanitize(rawTx.category),
-            description: sanitize(rawTx.description)
+            amount: parseFloat(rawTx.amount), // 强制转数字
+            category: sanitize(rawTx.category), // 清洗
+            description: sanitize(rawTx.description) // 清洗
         };
         
         const transactions = await getTransactionsFromR2(env, userId);
@@ -499,7 +477,7 @@ export default {
   
   function getServiceWorker() {
     return `
-  const CACHE_NAME = 'aurora-app-v32-secure';
+  const CACHE_NAME = 'aurora-app-v31-secure';
   const urlsToCache = [
     '/', 
     '/manifest.json',
@@ -646,7 +624,6 @@ export default {
       <link rel="manifest" href="/manifest.json">
       <link rel="apple-touch-icon" href="${iconBase64}">
       <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
-      <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
       <style>
           :root { --primary: #8b5cf6; --bg: #020617; --text: #f8fafc; }
           body { margin: 0; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; background-color: var(--bg); color: var(--text); overflow: hidden; position: relative; }
@@ -691,8 +668,10 @@ export default {
           input::placeholder { color: #64748b; font-family: 'Plus Jakarta Sans', sans-serif; letter-spacing: normal; }
           input:focus { border-color: rgba(139, 92, 246, 0.5); background: rgba(0,0,0,0.4); box-shadow: 0 0 0 4px rgba(139,92,246,0.15); transform: translateY(-2px); }
           
-          /* Turnstile 样式调整 */
-          .cf-turnstile { margin-bottom: 16px; display: flex; justify-content: center; }
+          /* 验证码样式 */
+          .captcha-row { display: flex; align-items: center; justify-content: center; gap: 12px; }
+          .captcha-label { color: white; font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 700; min-width: 80px; text-align: right; }
+          #captcha-input { width: 120px; text-align: center; padding-left: 10px; padding-right: 10px; }
           
           button { 
               width: 100%; padding: 18px; border-radius: 20px; border: none; margin-top: 10px;
@@ -728,18 +707,21 @@ export default {
           
           <form id="form">
               <div class="input-group">
-                  <input type="text" id="username" name="username" placeholder="用户名" required autocomplete="username">
+                  <input type="text" id="username" placeholder="用户名" required autocomplete="username">
               </div>
               <div class="input-group">
-                  <input type="password" id="pwd" name="password" placeholder="密码" required autocomplete="current-password">
+                  <input type="password" id="pwd" placeholder="密码" required autocomplete="current-password">
               </div>
               
               <div class="input-group register-only" id="group-confirm">
                   <input type="password" id="pwd-confirm" placeholder="再次输入密码" autocomplete="new-password">
               </div>
               
-              <div id="group-turnstile">
-                  <div class="cf-turnstile" data-sitekey="REPLACE_WITH_YOUR_SITE_KEY" data-theme="dark"></div>
+              <div class="input-group register-only" id="group-captcha">
+                  <div class="captcha-row">
+                      <div class="captcha-label" id="captcha-question">1+1=?</div>
+                      <input type="number" id="captcha-input" placeholder="计算结果" inputmode="numeric">
+                  </div>
               </div>
   
               <button type="submit" id="btn">立即登录</button>
@@ -750,6 +732,7 @@ export default {
   
       <script>
           let isLogin = true;
+          let captchaAnswer = 0; // 存储正确的验证码答案
   
           const els = {
               title: document.getElementById('title'),
@@ -761,8 +744,19 @@ export default {
               username: document.getElementById('username'),
               pwd: document.getElementById('pwd'),
               pwdConfirm: document.getElementById('pwd-confirm'),
+              captchaInput: document.getElementById('captcha-input'),
+              captchaLabel: document.getElementById('captcha-question'),
               regFields: document.querySelectorAll('.register-only')
           };
+  
+          // 生成简单的数学验证码
+          function generateCaptcha() {
+              const a = Math.floor(Math.random() * 10) + 1; // 1-10
+              const b = Math.floor(Math.random() * 10) + 1; // 1-10
+              captchaAnswer = a + b;
+              els.captchaLabel.innerText = \`\${a} + \${b} = ?\`;
+              els.captchaInput.value = '';
+          }
   
           function toggleMode() {
               isLogin = !isLogin;
@@ -776,7 +770,9 @@ export default {
                   els.switchBtn.innerText = '没有账号？点击注册';
                   els.regFields.forEach(el => el.style.display = 'none');
                   
+                  // 清空注册字段防止干扰
                   els.pwdConfirm.value = '';
+                  els.captchaInput.value = '';
               } else {
                   // 切换到注册模式
                   els.title.innerText = 'Join Aurora';
@@ -784,9 +780,10 @@ export default {
                   els.btn.innerText = '注册并登录';
                   els.switchBtn.innerText = '已有账号？返回登录';
                   els.regFields.forEach(el => el.style.display = 'block');
+                  
+                  // 生成验证码
+                  generateCaptcha();
               }
-              // 切换模式时重置验证码
-              if (window.turnstile) turnstile.reset();
               els.username.focus();
           }
   
@@ -796,26 +793,27 @@ export default {
               
               const username = els.username.value.trim();
               const password = els.pwd.value;
-              let cfToken = '';
   
-              // 1. 验证两次密码是否一致 (仅注册)
+              // --- 前端验证逻辑 ---
               if (!isLogin) {
+                  // 1. 验证两次密码是否一致
                   const confirm = els.pwdConfirm.value;
                   if (password !== confirm) {
                       showError('两次输入的密码不一致');
                       els.pwdConfirm.focus();
                       return;
                   }
-              }
   
-              // 2. 获取 Turnstile Token (核心修改：登录注册均需要)
-              const formData = new FormData(els.form);
-              cfToken = formData.get('cf-turnstile-response');
-              
-              if (!cfToken) {
-                  showError('请完成人机验证');
-                  return;
+                  // 2. 验证数学题
+                  const userAnswer = parseInt(els.captchaInput.value);
+                  if (isNaN(userAnswer) || userAnswer !== captchaAnswer) {
+                      showError('验证码计算错误，请重试');
+                      generateCaptcha(); // 输错刷新题目
+                      els.captchaInput.focus();
+                      return;
+                  }
               }
+              // ------------------
   
               const originalText = els.btn.innerText;
               els.btn.innerText = '处理中...';
@@ -827,8 +825,7 @@ export default {
                   const res = await fetch(endpoint, { 
                       method: 'POST', 
                       headers: { 'Content-Type': 'application/json' }, 
-                      // 核心修改：登录也发送 cfToken
-                      body: JSON.stringify({ username, password, cfToken }) 
+                      body: JSON.stringify({ username, password }) 
                   });
                   
                   const data = await res.json();
@@ -839,10 +836,11 @@ export default {
                           window.location.href = '/'; 
                       } else {
                           els.btn.innerText = '注册成功，登录中...';
+                          // 注册成功后自动登录
                           const loginRes = await fetch('/api/auth/login', {
                               method: 'POST',
                               headers: { 'Content-Type': 'application/json' },
-                              body: JSON.stringify({ username, password, cfToken }) // 自动登录也带 Token
+                              body: JSON.stringify({ username, password })
                           });
                           if (loginRes.ok) window.location.href = '/';
                           else throw new Error('自动登录失败，请手动登录');
@@ -854,8 +852,8 @@ export default {
                   showError(e.message);
                   els.btn.innerText = originalText; 
                   els.btn.disabled = false; 
-                  // 失败后重置验证码 (登录注册均需要)
-                  if (window.turnstile) turnstile.reset();
+                  // 如果是注册失败，刷新验证码
+                  if (!isLogin) generateCaptcha();
               }
           }
   
