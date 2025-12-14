@@ -68,9 +68,9 @@ Cloudflare Turnstile 验证的具体指南。
 创建一个新的 Widget。
 获取 Site Key (用于前端 HTML)。
 获取 Secret Key (用于后端 Worker 验证)。
-在 Worker 的设置 (Settings) > 变量 (Variables) 中，添加一个名为 TURNSTILE_SECRET 的环境变量，填入你的 Secret Key。
-修改第742行里找到 data-sitekey="REPLACE_WITH_YOUR_SITE_KEY"，将其替换为你自己的 Site Key
-
+变量名 (Variable name)	值 (Value)	说明
+TURNSTILE_SITE_KEY	0x4AAAA...	你的 Turnstile 站点密钥 (前端用，明文)
+TURNSTILE_SECRET	0x4AAAA...	你的 Turnstile 密钥 (后端用，建议点击 Encrypt 加密)
 
 
 ### 第八步：设置密码（可选）
