@@ -4,25 +4,29 @@ export default {
       const path = url.pathname;
       const method = request.method;
   
-      // CORS headers
-      const corsHeaders = {
-        'Access-Control-Allow-Origin': '*',
+      // 安全响应头
+      const securityHeaders = {
+        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self';",
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+        'Referrer-Policy': 'strict-origin-when-cross-origin',
+        'Access-Control-Allow-Origin': url.origin, // 仅允许同源
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type',
       };
   
       if (method === 'OPTIONS') {
-        return new Response(null, { headers: corsHeaders });
+        return new Response(null, { headers: securityHeaders });
       }
   
       try {
-        // 鉴权逻辑 (依赖 KV)
-        if (path !== '/login' && !path.startsWith('/api/auth')) {
+        // 路由守卫
+        if (path !== '/login' && !path.startsWith('/api/auth') && path !== '/manifest.json' && path !== '/sw.js') {
           const isAuthenticated = await checkAuthentication(request, env);
           if (!isAuthenticated) {
             return new Response(getLoginPageHTML(), {
               status: 302,
-              headers: { 'Content-Type': 'text/html', ...corsHeaders },
+              headers: { 'Content-Type': 'text/html', ...securityHeaders },
             });
           }
         }
@@ -30,19 +34,19 @@ export default {
         // 首页 HTML
         if (path === '/') {
           return new Response(getHTML(), {
-            headers: { 'Content-Type': 'text/html', ...corsHeaders },
+            headers: { 'Content-Type': 'text/html', ...securityHeaders },
           });
         }
   
-        // API 路由逻辑
+        // API 路由
         if (path.startsWith('/api/')) {
           const response = await handleAPIRequest(request, env, path, method);
-          Object.entries(corsHeaders).forEach(([key, value]) => {
+          Object.entries(securityHeaders).forEach(([key, value]) => {
             response.headers.set(key, value);
           });
           return response;
         }
-        
+  
         // PWA Manifest
         if (path === '/manifest.json') {
           return new Response(getManifest(), {
@@ -52,7 +56,7 @@ export default {
             },
           });
         }
-        
+  
         // Service Worker
         if (path === '/sw.js') {
           return new Response(getServiceWorker(), {
@@ -65,7 +69,7 @@ export default {
   
         if (path === '/login') {
           return new Response(getLoginPageHTML(), {
-            headers: { 'Content-Type': 'text/html', ...corsHeaders },
+            headers: { 'Content-Type': 'text/html', ...securityHeaders },
           });
         }
   
@@ -73,15 +77,64 @@ export default {
       } catch (error) {
         return new Response(JSON.stringify({ error: error.message }), {
           status: 500,
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+          headers: { 'Content-Type': 'application/json', ...securityHeaders },
         });
       }
     },
   };
   
-  // --- 核心逻辑 ---
+  // --- 安全辅助函数 ---
   
-  // 鉴权仍然使用 KV
+  // 1. 密码加盐哈希 (PBKDF2)
+  async function hashPassword(password, salt = null) {
+    const enc = new TextEncoder();
+    if (!salt) {
+      salt = crypto.getRandomValues(new Uint8Array(16)); // 生成随机盐
+    } else {
+      // 恢复盐的格式
+      salt = Uint8Array.from(atob(salt), c => c.charCodeAt(0));
+    }
+    
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveBits", "deriveKey"]
+    );
+    
+    const key = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: salt, iterations: 100000, hash: "SHA-256" },
+      keyMaterial, { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]
+    );
+    
+    // 导出 Key 为 Raw 数据用于存储
+    const exported = await crypto.subtle.exportKey("raw", key);
+    
+    // 返回 base64 格式的 Salt 和 Hash
+    const saltStr = btoa(String.fromCharCode(...salt));
+    const hashStr = btoa(String.fromCharCode(...new Uint8Array(exported)));
+    return { salt: saltStr, hash: hashStr };
+  }
+  
+  // 2. 验证密码
+  async function verifyPassword(inputPassword, storedSalt, storedHash) {
+    const result = await hashPassword(inputPassword, storedSalt);
+    return result.hash === storedHash;
+  }
+  
+  // 3. 安全随机 Token
+  function generateSecureToken() {
+    const array = new Uint8Array(32);
+    crypto.getRandomValues(array);
+    return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+  
+  // 4. 输入清洗 (防止 XSS)
+  function sanitize(str) {
+    if (typeof str !== 'string') return str;
+    return str.replace(/[&<>"'/]/g, (char) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '/': '&#x2F;'
+    }[char]));
+  }
+  
+  // --- 鉴权逻辑 ---
   async function checkAuthentication(request, env) {
     const cookieHeader = request.headers.get('Cookie') || '';
     const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
@@ -96,68 +149,185 @@ export default {
     return false;
   }
   
-  // --- 关键修改：智能读取函数 (含自动迁移) ---
+  async function getCurrentUser(request, env) {
+    const kv = env.ACCOUNTING_KV;
+    const cookieHeader = request.headers.get('Cookie') || '';
+    const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
+      const [name, value] = cookie.trim().split('=');
+      acc[name] = value;
+      return acc;
+    }, {});
+  
+    if (cookies.auth_token) {
+      const sessionStr = await kv.get(`session_${cookies.auth_token}`);
+      if (sessionStr) {
+        return JSON.parse(sessionStr); 
+      }
+    }
+    return null;
+  }
+  
+  // --- R2 逻辑 ---
   async function getTransactionsFromR2(env, userId) {
       const r2Key = `transactions_${userId}.json`;
-      
-      // 1. 优先尝试从 R2 读取
       const object = await env.ACCOUNTING_BUCKET.get(r2Key);
-      
       if (object !== null) {
-          // R2 有数据，直接返回
-          try {
-              return await object.json();
-          } catch (e) {
-              console.error("R2 JSON parse error", e);
-              return [];
-          }
+          try { return await object.json(); } catch (e) { return []; }
       }
-  
-      // 2. R2 是空的？检查 KV 是否有旧数据 (自动迁移逻辑)
-      const kvKey = `transactions_${userId}`;
-      const oldData = await env.ACCOUNTING_KV.get(kvKey, 'json');
-      
-      if (oldData && Array.isArray(oldData) && oldData.length > 0) {
-          // 发现 KV 有数据！立刻搬运到 R2
-          await env.ACCOUNTING_BUCKET.put(r2Key, JSON.stringify(oldData));
-          return oldData; // 返回旧数据
-      }
-  
-      // 3. 都没有，确实是新用户
       return [];
   }
   
-  // 写入数据到 R2
   async function saveTransactionsToR2(env, userId, data) {
       const key = `transactions_${userId}.json`;
       await env.ACCOUNTING_BUCKET.put(key, JSON.stringify(data));
   }
   
+  // --- API 处理逻辑 ---
   async function handleAPIRequest(request, env, path, method) {
     const kv = env.ACCOUNTING_KV; 
-    const userId = 'default_user'; 
   
-    // --- Auth API (KV) ---
-    if (path === '/api/auth/login' && method === 'POST') {
-      const { password } = await request.json();
-      const correctPassword = env.ADMIN_PASSWORD || await kv.get('app_password');
-      
-      if (password === correctPassword) {
-        const token = generateToken();
-        const expiresAt = Date.now() + (24 * 60 * 60 * 1000);
-        await kv.put(`session_${token}`, JSON.stringify({ userId, expiresAt }), { expirationTtl: 86400 });
-        return new Response(JSON.stringify({ success: true, token }), {
-          status: 200,
-          headers: { 
-            'Content-Type': 'application/json',
-            'Set-Cookie': `auth_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`
-          },
-        });
-      } else {
-        return new Response(JSON.stringify({ error: '密码错误' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+    // --- 1. 注册接口 (包含安全问题) ---
+    if (path === '/api/auth/register' && method === 'POST') {
+      try {
+        const { username, password, question, answer } = await request.json();
+        
+        if (!username || !password) return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400 });
+        if (!question || !answer) return new Response(JSON.stringify({ error: '请设置安全问题和答案，用于找回密码' }), { status: 400 });
+        
+        const cleanUsername = sanitize(username); 
+  
+        const existingUser = await kv.get(`u_${cleanUsername}`);
+        if (existingUser) return new Response(JSON.stringify({ error: '用户名已存在' }), { status: 409 });
+  
+        // 1. 密码哈希
+        const pwdResult = await hashPassword(password);
+        // 2. 安全问题答案哈希
+        const ansResult = await hashPassword(answer);
+        
+        const userId = generateSecureToken(); 
+        
+        const userData = { 
+          salt: pwdResult.salt, 
+          hash: pwdResult.hash, 
+          question: sanitize(question),
+          answerSalt: ansResult.salt,
+          answerHash: ansResult.hash,
+          userId, 
+          createdAt: Date.now() 
+        };
+        
+        await kv.put(`u_${cleanUsername}`, JSON.stringify(userData));
+  
+        return new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 500 });
       }
     }
   
+    // --- 新增：获取安全问题 ---
+    if (path === '/api/auth/get_question' && method === 'POST') {
+        try {
+            const { username } = await request.json();
+            const cleanUsername = sanitize(username);
+            const userStr = await kv.get(`u_${cleanUsername}`);
+            
+            if (!userStr) return new Response(JSON.stringify({ error: '用户不存在' }), { status: 404 });
+            
+            const userData = JSON.parse(userStr);
+            if (!userData.question) return new Response(JSON.stringify({ error: '该账号未设置安全问题' }), { status: 400 });
+            
+            return new Response(JSON.stringify({ question: userData.question }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        } catch (e) {
+            return new Response(JSON.stringify({ error: '查询失败' }), { status: 500 });
+        }
+    }
+  
+    // --- 新增：通过安全问题重置密码 ---
+    if (path === '/api/auth/reset_password' && method === 'POST') {
+        try {
+            const { username, answer, newPassword } = await request.json();
+            const cleanUsername = sanitize(username);
+            
+            const userStr = await kv.get(`u_${cleanUsername}`);
+            if (!userStr) return new Response(JSON.stringify({ error: '用户不存在' }), { status: 404 });
+            
+            const userData = JSON.parse(userStr);
+            
+            // 验证答案
+            if (!userData.answerSalt || !userData.answerHash) {
+                return new Response(JSON.stringify({ error: '该账号不支持安全问题重置，请联系管理员' }), { status: 403 });
+            }
+            
+            const isAnswerCorrect = await verifyPassword(answer, userData.answerSalt, userData.answerHash);
+            
+            if (!isAnswerCorrect) {
+                return new Response(JSON.stringify({ error: '安全问题答案错误' }), { status: 401 });
+            }
+            
+            // 答案正确，重置密码
+            const newPwdResult = await hashPassword(newPassword);
+            userData.salt = newPwdResult.salt;
+            userData.hash = newPwdResult.hash;
+            
+            // 更新数据库
+            await kv.put(`u_${cleanUsername}`, JSON.stringify(userData));
+            
+            return new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            
+        } catch (e) {
+            return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+        }
+    }
+  
+    // --- 2. 登录接口 ---
+    if (path === '/api/auth/login' && method === 'POST') {
+      const { username, password } = await request.json();
+      if (!username || !password) return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400 });
+  
+      const cleanUsername = sanitize(username);
+      const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+      const rateLimitKey = `limit_${ip}`;
+      
+      // 防暴力破解检测
+      let attempts = parseInt(await kv.get(rateLimitKey) || '0');
+      if (attempts >= 5) {
+          return new Response(JSON.stringify({ error: '尝试次数过多，请15分钟后再试' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+      }
+  
+      const userStr = await kv.get(`u_${cleanUsername}`);
+      
+      if (userStr) {
+        const userData = JSON.parse(userStr);
+        // 兼容逻辑
+        if (!userData.salt || !userData.hash) {
+             return new Response(JSON.stringify({ error: '账号数据需升级，请联系管理员或重新注册' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+        }
+  
+        const isValid = await verifyPassword(password, userData.salt, userData.hash);
+  
+        if (isValid) {
+          // 登录成功，清除错误计数
+          await kv.delete(rateLimitKey);
+  
+          const token = generateSecureToken();
+          await kv.put(`session_${token}`, JSON.stringify({ userId: userData.userId, username: cleanUsername }), { expirationTtl: 86400 });
+          
+          return new Response(JSON.stringify({ success: true, token }), {
+            status: 200,
+            headers: { 
+              'Content-Type': 'application/json',
+              'Set-Cookie': `auth_token=${token}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=86400`
+            },
+          });
+        }
+      }
+      
+      // 登录失败：记录尝试次数 (TTL 15分钟)
+      await kv.put(rateLimitKey, (attempts + 1).toString(), { expirationTtl: 900 });
+      return new Response(JSON.stringify({ error: '账号或密码错误' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+    }
+  
+    // 3. 登出
     if (path === '/api/auth/logout' && method === 'POST') {
       const cookieHeader = request.headers.get('Cookie') || '';
       const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
@@ -168,11 +338,17 @@ export default {
       if (cookies.auth_token) await kv.delete(`session_${cookies.auth_token}`);
       return new Response(JSON.stringify({ success: true }), {
         status: 200,
-        headers: { 'Content-Type': 'application/json', 'Set-Cookie': 'auth_token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0' },
+        headers: { 'Content-Type': 'application/json', 'Set-Cookie': 'auth_token=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0' },
       });
     }
   
-    // --- Transaction API (智能 R2) ---
+    const currentUser = await getCurrentUser(request, env);
+    if (!currentUser) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
+    }
+    const userId = currentUser.userId;
+  
+    // --- 账单业务逻辑 ---
     
     if (path === '/api/transactions') {
       if (method === 'GET') {
@@ -180,27 +356,30 @@ export default {
         return new Response(JSON.stringify(transactions), { headers: { 'Content-Type': 'application/json' } });
       }
       if (method === 'POST') {
-        const transaction = await request.json();
-        transaction.id = generateToken();
-        transaction.timestamp = new Date().toISOString();
+        const rawTx = await request.json();
+        
+        // **输入清洗**
+        const transaction = {
+            id: generateSecureToken(),
+            timestamp: new Date().toISOString(),
+            type: rawTx.type,
+            amount: parseFloat(rawTx.amount), 
+            category: sanitize(rawTx.category), 
+            description: sanitize(rawTx.description) 
+        };
         
         const transactions = await getTransactionsFromR2(env, userId);
         transactions.push(transaction);
-        
         await saveTransactionsToR2(env, userId, transactions);
-        
         return new Response(JSON.stringify(transactions), { status: 201, headers: { 'Content-Type': 'application/json' } });
       }
     }
   
     if (path.startsWith('/api/transactions/') && method === 'DELETE') {
       const transactionId = path.split('/').pop();
-      
       const transactions = await getTransactionsFromR2(env, userId);
       const filteredTransactions = transactions.filter(t => t.id !== transactionId);
-      
       await saveTransactionsToR2(env, userId, filteredTransactions);
-      
       return new Response(JSON.stringify(filteredTransactions), { headers: { 'Content-Type': 'application/json' } });
     }
   
@@ -238,7 +417,7 @@ export default {
     return new Response('Not Found', { status: 404 });
   }
   
-  // --- 逻辑函数 (保持不变) ---
+  // --- 计算逻辑 ---
   function calculateDailyBalances(transactions, targetYear, targetMonth) {
       const monthlyTransactions = transactions.filter(t => {
           const d = new Date(t.timestamp);
@@ -359,7 +538,7 @@ export default {
   
   function getServiceWorker() {
     return `
-  const CACHE_NAME = 'aurora-app-v28';
+  const CACHE_NAME = 'aurora-app-v31-secure';
   const urlsToCache = [
     '/', 
     '/manifest.json',
@@ -462,8 +641,6 @@ export default {
     }`;
   }
   
-  function generateToken() { return Math.random().toString(36).substring(2) + Date.now().toString(36); }
-  
   function calculateSummary(transactions, period = 'daily') {
     let income = 0, expense = 0;
     const now = new Date();
@@ -495,126 +672,435 @@ export default {
     return { totalIncome: income, totalExpense: expense, balance: income - expense, transactionCount: filtered.length, period };
   }
   
+  // --- 登录/注册页面 (HTML + JS) ---
   function getLoginPageHTML() {
-      const iconBase64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48ZGVmcz48bGluZWFyR3JhZGllbnQgaWQ9ImEiIHgxPSIwIiB5MT0iMCIgeDI9IjUxMiIgeTI9IjUxMiIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzYzNjZmMSIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iI2E4NTVmNyIvPjwvbGluZWFyR3JhZGllbnQ+PC9kZWZzPjxyZWN0IHdpZHRoPSI1MTIiIGhlaWdodD0iNTEyIiByeD0iMTI4IiBmaWxsPSJ1cmwoI2EpIi8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTI1NiAxMjhsLTMyIDgwSDEyOGw4MCAzMi04MCAzMmg5NmwzMiA4MEwyNTYgNDAwTDI4OCAyNTZoOTZsMzItODBoLTk2ek0yNTYgMTkybDMyIDgwaDk2bDMyLTgwaC05NnoiLz48L3N2Zz4=";
-      return `<!DOCTYPE html>
-  <html lang="zh-CN">
-  <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-      <title>登录 - 极光记账</title>
-      <meta name="theme-color" content="#020617">
-      <link rel="manifest" href="/manifest.json">
-      <link rel="apple-touch-icon" href="${iconBase64}">
-      <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
-      <style>
-          :root { --primary: #8b5cf6; --bg: #020617; --text: #f8fafc; }
-          body { margin: 0; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; background-color: var(--bg); color: var(--text); overflow: hidden; position: relative; }
-          
-          .aurora-bg { position: absolute; width: 150%; height: 150%; top: -25%; left: -25%; z-index: -1; background: radial-gradient(at 0% 0%, hsla(253,16%,7%,1) 0, transparent 50%), radial-gradient(at 50% 0%, hsla(225,39%,30%,1) 0, transparent 50%), radial-gradient(at 100% 0%, hsla(339,49%,30%,1) 0, transparent 50%); filter: blur(60px); opacity: 0.6; animation: aurora-spin 20s linear infinite; }
-          @keyframes aurora-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-          
-          .card { 
-              background: rgba(30, 41, 59, 0.3); 
-              backdrop-filter: blur(24px) saturate(180%); -webkit-backdrop-filter: blur(24px) saturate(180%); 
-              border: 1px solid rgba(255, 255, 255, 0.1); 
-              padding: 56px 40px; border-radius: 40px; 
-              width: 85%; max-width: 380px; text-align: center; 
-              box-shadow: 0 40px 80px -12px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(255,255,255,0.05); 
-              animation: floatIn 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); 
-              position: relative; overflow: hidden;
-          }
-          
-          /* Shine effect */
-          .card::before {
-              content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
-              background: linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent);
-              transition: 0.5s; pointer-events: none;
-          }
-          .card:hover::before { left: 100%; transition: 0.8s ease-in-out; }
-  
-          @keyframes floatIn { from { opacity: 0; transform: translateY(30px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
-          
-          .logo-img { width: 88px; height: 88px; margin-bottom: 32px; filter: drop-shadow(0 0 30px rgba(139,92,246,0.4)); border-radius: 24px; transition: transform 0.5s ease; }
-          .card:hover .logo-img { transform: scale(1.05) rotate(3deg); }
-          
-          h1 { margin: 0 0 12px 0; font-size: 32px; font-weight: 800; color: white; letter-spacing: -1px; background: linear-gradient(to right, #fff, #c4b5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-          p { margin: 0 0 48px 0; color: #94a3b8; font-size: 15px; font-weight: 500; }
-          
-          .input-group { position: relative; margin-bottom: 24px; }
-          input { 
-              width: 100%; padding: 20px 24px; border-radius: 24px; 
-              border: 1px solid rgba(255,255,255,0.08); 
-              background: rgba(0,0,0,0.2); 
-              color: white; font-size: 18px; letter-spacing: 4px; 
-              outline: none; text-align: center; transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1); 
-              box-sizing: border-box; font-family: 'Plus Jakarta Sans', monospace; 
-          }
-          input::placeholder { font-size: 16px; letter-spacing: normal; opacity: 0.4; font-family: 'Plus Jakarta Sans', sans-serif; }
-          input:focus { border-color: rgba(139, 92, 246, 0.5); background: rgba(0,0,0,0.4); box-shadow: 0 0 0 4px rgba(139,92,246,0.15); transform: translateY(-2px); }
-          
-          button { 
-              width: 100%; padding: 20px; border-radius: 24px; border: none; 
-              background: linear-gradient(135deg, #6366f1, #a855f7, #ec4899); 
-              background-size: 200% 200%;
-              animation: gradient-anim 5s ease infinite;
-              color: white; font-size: 16px; font-weight: 700; cursor: pointer; 
-              transition: all 0.3s; 
-              box-shadow: 0 10px 25px -10px rgba(99, 102, 241, 0.6); 
-          }
-          @keyframes gradient-anim { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
-          
-          button:hover { transform: translateY(-3px); box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.7); }
-          button:active { transform: scale(0.97); }
-          button:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
-          
-          .error { color: #f43f5e; font-size: 14px; margin-bottom: 24px; display: none; background: rgba(244,63,94,0.15); padding: 12px; border-radius: 16px; animation: shake 0.5s cubic-bezier(.36,.07,.19,.97) both; }
-          @keyframes shake { 10%, 90% { transform: translate3d(-1px, 0, 0); } 20%, 80% { transform: translate3d(2px, 0, 0); } 30%, 50%, 70% { transform: translate3d(-4px, 0, 0); } 40%, 60% { transform: translate3d(4px, 0, 0); } }
-      </style>
-  </head>
-  <body>
-      <div class="aurora-bg"></div>
-      <div class="card">
-          <img src="${iconBase64}" class="logo-img" alt="Logo">
-          <h1>Welcome Back</h1>
-          <p>安全访问您的个人账本</p>
-          <div id="error" class="error"></div>
-          <form id="form">
-              <div class="input-group">
-                  <input type="password" id="pwd" placeholder="输入密码" required>
-              </div>
-              <button type="submit" id="btn">解锁进入</button>
-          </form>
-      </div>
-      <script>
-          document.getElementById('form').onsubmit = async (e) => {
-              e.preventDefault();
-              const btn = document.getElementById('btn');
-              const err = document.getElementById('error');
-              err.style.display = 'none';
-              const originalText = btn.innerText;
-              btn.innerText = '验证中...';
-              btn.disabled = true;
-              try {
-                  const res = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: document.getElementById('pwd').value }) });
-                  if (res.ok) { 
-                      btn.innerText = '验证成功';
-                      window.location.href = '/'; 
-                  } else { 
-                      const data = await res.json(); 
-                      throw new Error(data.error || '登录失败'); 
-                  }
-              } catch (e) { 
-                  err.innerText = e.message; err.style.display = 'block'; 
-                  btn.innerText = originalText; btn.disabled = false; 
-                  document.getElementById('pwd').value = '';
-                  document.getElementById('pwd').focus();
-              }
-          }
-      </script>
-  </body>
-  </html>`;
-  }
+    const iconBase64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48ZGVmcz48bGluZWFyR3JhZGllbnQgaWQ9ImEiIHgxPSIwIiB5MT0iMCIgeDI9IjUxMiIgeTI9IjUxMiIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzYzNjZmMSIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iI2E4NTVmNyIvPjwvbGluZWFyR3JhZGllbnQ+PC9kZWZzPjxyZWN0IHdpZHRoPSI1MTIiIGhlaWdodD0iNTEyIiByeD0iMTI4IiBmaWxsPSJ1cmwoI2EpIi8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTI1NiAxMjhsLTMyIDgwSDEyOGw4MCAzMi04MCAzMmg5NmwzMiA4MEwyNTYgNDAwTDI4OCAyNTZoOTZsMzItODBoLTk2ek0yNTYgMTkybDMyIDgwaDk2bDMyLTgwaC05NnoiLz48L3N2Zz4=";
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>登录 - 极光记账</title>
+    <meta name="theme-color" content="#020617">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="apple-touch-icon" href="${iconBase64}">
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root { --primary: #8b5cf6; --bg: #020617; --text: #f8fafc; }
+        body { margin: 0; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; background-color: var(--bg); color: var(--text); overflow: hidden; position: relative; }
+        
+        .aurora-bg { position: absolute; width: 150%; height: 150%; top: -25%; left: -25%; z-index: -1; background: radial-gradient(at 0% 0%, hsla(253,16%,7%,1) 0, transparent 50%), radial-gradient(at 50% 0%, hsla(225,39%,30%,1) 0, transparent 50%), radial-gradient(at 100% 0%, hsla(339,49%,30%,1) 0, transparent 50%); filter: blur(60px); opacity: 0.6; animation: aurora-spin 20s linear infinite; }
+        @keyframes aurora-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
+        .card { 
+            background: rgba(30, 41, 59, 0.3); 
+            backdrop-filter: blur(24px) saturate(180%); -webkit-backdrop-filter: blur(24px) saturate(180%); 
+            border: 1px solid rgba(255, 255, 255, 0.1); 
+            padding: 48px 40px; border-radius: 40px; 
+            width: 85%; max-width: 380px; text-align: center; 
+            box-shadow: 0 40px 80px -12px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(255,255,255,0.05); 
+            animation: floatIn 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); 
+            position: relative; overflow: hidden;
+            transition: height 0.3s ease;
+        }
+        .card::before {
+            content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent);
+            transition: 0.5s; pointer-events: none;
+        }
+        .card:hover::before { left: 100%; transition: 0.8s ease-in-out; }
+        @keyframes floatIn { from { opacity: 0; transform: translateY(30px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
+        
+        .logo-img { width: 80px; height: 80px; margin-bottom: 20px; filter: drop-shadow(0 0 30px rgba(139,92,246,0.4)); border-radius: 24px; transition: transform 0.5s ease; }
+        .card:hover .logo-img { transform: scale(1.05) rotate(3deg); }
+        
+        h1 { margin: 0 0 8px 0; font-size: 32px; font-weight: 800; color: white; letter-spacing: -1px; background: linear-gradient(to right, #fff, #c4b5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        p { margin: 0 0 32px 0; color: #94a3b8; font-size: 15px; font-weight: 500; }
+        
+        .input-group { position: relative; margin-bottom: 16px; transition: all 0.3s ease; }
+        input, select { 
+            width: 100%; padding: 16px 24px; border-radius: 20px; 
+            border: 1px solid rgba(255,255,255,0.08); 
+            background: rgba(0,0,0,0.2); 
+            color: white; font-size: 16px; 
+            outline: none; text-align: left; transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1); 
+            box-sizing: border-box; font-family: 'Plus Jakarta Sans', monospace; 
+            appearance: none;
+        }
+        select { color: #f8fafc; cursor: pointer; }
+        select option { background: #1e293b; color: white; }
+        input::placeholder { color: #64748b; font-family: 'Plus Jakarta Sans', sans-serif; letter-spacing: normal; }
+        input:focus, select:focus { border-color: rgba(139, 92, 246, 0.5); background: rgba(0,0,0,0.4); box-shadow: 0 0 0 4px rgba(139,92,246,0.15); transform: translateY(-2px); }
+        
+        /* 验证码样式 */
+        .captcha-row { display: flex; align-items: center; justify-content: center; gap: 12px; }
+        .captcha-label { color: white; font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 700; min-width: 80px; text-align: right; }
+        #captcha-input { width: 120px; text-align: center; padding-left: 10px; padding-right: 10px; }
+        
+        button { 
+            width: 100%; padding: 18px; border-radius: 20px; border: none; margin-top: 10px;
+            background: linear-gradient(135deg, #6366f1, #a855f7, #ec4899); 
+            background-size: 200% 200%;
+            animation: gradient-anim 5s ease infinite;
+            color: white; font-size: 16px; font-weight: 700; cursor: pointer; 
+            transition: all 0.3s; 
+            box-shadow: 0 10px 25px -10px rgba(99, 102, 241, 0.6); 
+        }
+        @keyframes gradient-anim { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
+        button:hover { transform: translateY(-3px); box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.7); }
+        button:active { transform: scale(0.97); }
+        button:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
+        
+        .footer-links { margin-top: 24px; display: flex; justify-content: center; gap: 16px; font-size: 14px; color: #94a3b8; }
+        .link-btn { cursor: pointer; transition: 0.3s; position: relative; }
+        .link-btn:hover { color: white; }
+        .link-btn::after { content: ''; position: absolute; bottom: -2px; left: 0; width: 0; height: 1px; background: white; transition: 0.3s; }
+        .link-btn:hover::after { width: 100%; }
+
+        /* 错误提示框样式 */
+        .error { color: #f43f5e; font-size: 14px; margin-bottom: 20px; display: none; background: rgba(244,63,94,0.15); padding: 12px; border-radius: 16px; animation: shake 0.5s cubic-bezier(.36,.07,.19,.97) both; }
+        @keyframes shake { 10%, 90% { transform: translate3d(-1px, 0, 0); } 20%, 80% { transform: translate3d(2px, 0, 0); } 30%, 50%, 70% { transform: translate3d(-4px, 0, 0); } 40%, 60% { transform: translate3d(4px, 0, 0); } }
+
+        /* 新增：成功提示框样式 (替代丑陋的alert) */
+        .success { color: #34d399; font-size: 14px; margin-bottom: 20px; display: none; background: rgba(52, 211, 153, 0.15); padding: 12px; border-radius: 16px; animation: slideDown 0.4s ease both; border: 1px solid rgba(52, 211, 153, 0.2); }
+        @keyframes slideDown { from { transform: translateY(-10px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        
+        /* 隐藏字段控制 */
+        .mode-register, .mode-reset { display: none; }
+        
+        .security-label { text-align: left; font-size: 12px; color: #94a3b8; margin: 4px 0 8px 4px; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div class="aurora-bg"></div>
+    <div class="card">
+        <img src="${iconBase64}" class="logo-img" alt="Logo">
+        <h1 id="title">Welcome</h1>
+        <p id="subtitle">登录您的个人账本</p>
+        
+        <div id="error" class="error"></div>
+        <div id="success" class="success"></div>
+        
+        <form id="form">
+            <div class="input-group">
+                <input type="text" id="username" placeholder="用户名" required autocomplete="username">
+            </div>
+
+            <div class="input-group mode-register">
+                <select id="reg-question">
+                    <option value="" disabled selected>选择安全问题 (用于找回密码)</option>
+                    <option value="father_name">父亲的名字是？</option>
+                    <option value="mother_name">母亲的名字是？</option>
+                    <option value="pet_name">第一只宠物的名字？</option>
+                    <option value="school_name">小学的名字？</option>
+                    <option value="first_car">第一辆车的型号？</option>
+                    <option value="custom">自定义问题...</option>
+                </select>
+            </div>
+            
+            <div class="input-group" style="display:none" id="custom-q-row">
+                 <input type="text" id="custom-question" placeholder="请输入自定义问题">
+            </div>
+
+            <div class="input-group mode-register">
+                <input type="text" id="reg-answer" placeholder="问题答案 (请牢记)">
+            </div>
+            
+            <div class="mode-reset" id="reset-q-display" style="display:none; text-align:left; background:rgba(255,255,255,0.05); padding:12px; border-radius:12px; margin-bottom:16px; color:#cbd5e1; font-size:14px;">
+                <span style="opacity:0.6">安全问题：</span><br><b id="reset-question-text">...</b>
+            </div>
+            
+            <div class="input-group mode-reset" style="display:none" id="reset-ans-row">
+                <input type="text" id="reset-answer" placeholder="请输入答案">
+            </div>
+
+            <div class="input-group" id="pwd-row">
+                <input type="password" id="pwd" placeholder="密码" required autocomplete="current-password">
+            </div>
+            
+            <div class="input-group mode-register mode-reset">
+                <input type="password" id="pwd-confirm" placeholder="再次输入密码" autocomplete="new-password">
+            </div>
+            
+            <div class="input-group mode-register" id="group-captcha">
+                <div class="captcha-row">
+                    <div class="captcha-label" id="captcha-question">1+1=?</div>
+                    <input type="number" id="captcha-input" placeholder="计算结果" inputmode="numeric">
+                </div>
+            </div>
+
+            <button type="submit" id="btn">立即登录</button>
+            <button type="button" id="btn-fetch-q" style="display:none; background:linear-gradient(135deg, #3b82f6, #06b6d4);">查找账号</button>
+        </form>
+        
+        <div class="footer-links">
+            <div class="link-btn" id="switchBtn" onclick="toggleMode()">注册账号</div>
+            <div style="opacity:0.3">|</div>
+            <div class="link-btn" id="forgotBtn" onclick="toggleReset()">忘记密码?</div>
+        </div>
+    </div>
+
+    <script>
+        let mode = 'login'; // login, register, reset
+        let captchaAnswer = 0;
+
+        const els = {
+            title: document.getElementById('title'),
+            subtitle: document.getElementById('subtitle'),
+            btn: document.getElementById('btn'),
+            btnFetch: document.getElementById('btn-fetch-q'),
+            switchBtn: document.getElementById('switchBtn'),
+            forgotBtn: document.getElementById('forgotBtn'),
+            form: document.getElementById('form'),
+            error: document.getElementById('error'),
+            success: document.getElementById('success'), // 新增引用
+            username: document.getElementById('username'),
+            pwd: document.getElementById('pwd'),
+            pwdRow: document.getElementById('pwd-row'),
+            pwdConfirm: document.getElementById('pwd-confirm'),
+            regQ: document.getElementById('reg-question'),
+            customQRow: document.getElementById('custom-q-row'),
+            customQ: document.getElementById('custom-question'),
+            regA: document.getElementById('reg-answer'),
+            resetQText: document.getElementById('reset-question-text'),
+            resetQDisplay: document.getElementById('reset-q-display'),
+            resetAnsRow: document.getElementById('reset-ans-row'),
+            resetAns: document.getElementById('reset-answer'),
+            captchaInput: document.getElementById('captcha-input'),
+            captchaLabel: document.getElementById('captcha-question'),
+            regFields: document.querySelectorAll('.mode-register'),
+            resetFields: document.querySelectorAll('.mode-reset')
+        };
+
+        function generateCaptcha() {
+            const a = Math.floor(Math.random() * 10) + 1;
+            const b = Math.floor(Math.random() * 10) + 1;
+            captchaAnswer = a + b;
+            els.captchaLabel.innerText = \`\${a} + \${b} = ?\`;
+            els.captchaInput.value = '';
+        }
+
+        function setUI(state) {
+            mode = state;
+            els.error.style.display = 'none';
+            els.success.style.display = 'none'; // 切换模式时隐藏成功提示
+            
+            // 隐藏所有模式特定字段
+            els.regFields.forEach(el => el.style.display = 'none');
+            els.resetFields.forEach(el => el.style.display = 'none');
+            
+            els.customQRow.style.display = 'none';
+            els.resetQDisplay.style.display = 'none';
+            els.resetAnsRow.style.display = 'none';
+            els.btnFetch.style.display = 'none';
+            els.btn.style.display = 'block';
+            els.pwdRow.style.display = 'block';
+
+            if (mode === 'login') {
+                els.title.innerText = 'Welcome';
+                els.subtitle.innerText = '登录您的个人账本';
+                els.btn.innerText = '立即登录';
+                els.switchBtn.innerText = '注册账号';
+                els.forgotBtn.style.display = 'block';
+                els.pwd.placeholder = '密码';
+                els.pwd.setAttribute('required', 'true');
+            } else if (mode === 'register') {
+                els.title.innerText = 'Join Aurora';
+                els.subtitle.innerText = '创建新账号并设置安全问题';
+                els.btn.innerText = '注册并登录';
+                els.switchBtn.innerText = '返回登录';
+                els.forgotBtn.style.display = 'none';
+                els.pwd.placeholder = '设置密码';
+                els.pwd.setAttribute('required', 'true');
+                
+                els.regFields.forEach(el => {
+                   if(el.tagName === 'DIV' && el.classList.contains('input-group')) el.style.display = 'block';
+                });
+                
+                if (els.regQ.value === 'custom') {
+                    els.customQRow.style.display = 'block';
+                }
+                
+                generateCaptcha();
+            } else if (mode === 'reset') {
+                els.title.innerText = 'Reset Password';
+                els.subtitle.innerText = '输入账号找回密码';
+                els.switchBtn.innerText = '返回登录';
+                els.forgotBtn.style.display = 'none';
+                
+                els.pwdRow.style.display = 'none'; 
+                els.pwd.removeAttribute('required'); 
+                
+                els.btn.style.display = 'none';
+                els.btnFetch.style.display = 'block';
+                els.pwdConfirm.parentElement.style.display = 'none'; 
+            }
+        }
+
+        function toggleMode() {
+            setUI(mode === 'login' ? 'register' : 'login');
+        }
+
+        function toggleReset() {
+            setUI('reset');
+        }
+
+        els.regQ.addEventListener('change', (e) => {
+             if (e.target.value === 'custom') {
+                 els.customQRow.style.display = 'block';
+                 els.customQ.focus();
+             } else {
+                 els.customQRow.style.display = 'none';
+             }
+        });
+
+        els.btnFetch.onclick = async () => {
+            const username = els.username.value.trim();
+            if(!username) return showError('请输入用户名');
+            
+            els.btnFetch.innerText = '查询中...';
+            try {
+                const res = await fetch('/api/auth/get_question', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ username })
+                });
+                const data = await res.json();
+                if(res.ok) {
+                    els.resetQText.innerText = data.question; 
+                    els.resetQDisplay.style.display = 'block';
+                    els.resetAnsRow.style.display = 'block';
+                    els.pwdConfirm.parentElement.style.display = 'block'; 
+                    els.pwdConfirm.placeholder = '设置新密码';
+                    
+                    els.btnFetch.style.display = 'none';
+                    els.btn.style.display = 'block';
+                    els.btn.innerText = '重置密码';
+                    els.username.readOnly = true; 
+                    els.resetAns.focus();
+                } else {
+                    showError(data.error);
+                }
+            } catch(e) {
+                showError('网络错误，请重试');
+            } finally {
+                els.btnFetch.innerText = '查找账号';
+            }
+        };
+
+        els.form.onsubmit = async (e) => {
+            e.preventDefault();
+            els.error.style.display = 'none';
+            els.success.style.display = 'none';
+            
+            const username = els.username.value.trim();
+            const password = els.pwd.value; 
+            
+            if (mode === 'register') {
+                const confirm = els.pwdConfirm.value;
+                let question = '';
+                
+                if (els.regQ.value === 'custom') {
+                    question = els.customQ.value.trim();
+                    if (!question) return showError('请输入自定义问题');
+                } else {
+                    const selectedOption = els.regQ.options[els.regQ.selectedIndex];
+                    if (!selectedOption || els.regQ.value === '') return showError('请选择安全问题');
+                    question = selectedOption.text;
+                }
+
+                const answer = els.regA.value.trim();
+                
+                if (password !== confirm) return showError('两次输入的密码不一致');
+                if (!answer) return showError('请填写问题答案');
+                
+                const userAnswer = parseInt(els.captchaInput.value);
+                if (isNaN(userAnswer) || userAnswer !== captchaAnswer) {
+                    showError('验证码错误'); generateCaptcha(); return;
+                }
+                
+                submitAuth('/api/auth/register', { username, password, question, answer });
+            } 
+            else if (mode === 'login') {
+                submitAuth('/api/auth/login', { username, password });
+            }
+            else if (mode === 'reset') {
+                const answer = els.resetAns.value.trim();
+                const newPassword = els.pwdConfirm.value;
+                if(!answer) return showError('请输入安全问题答案');
+                if(!newPassword) return showError('请输入新密码');
+                
+                submitAuth('/api/auth/reset_password', { username, answer, newPassword });
+            }
+        }
+
+        async function submitAuth(endpoint, payload) {
+            const originalText = els.btn.innerText;
+            els.btn.innerText = '处理中...';
+            els.btn.disabled = true;
+            
+            try {
+                const res = await fetch(endpoint, { 
+                    method: 'POST', 
+                    headers: { 'Content-Type': 'application/json' }, 
+                    body: JSON.stringify(payload) 
+                });
+                
+                const data = await res.json();
+                
+                if (res.ok) {
+                    if (mode === 'login') {
+                        window.location.href = '/'; 
+                    } else if (mode === 'register') {
+                        els.btn.innerText = '注册成功，登录中...';
+                        const loginRes = await fetch('/api/auth/login', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ username: payload.username, password: payload.password })
+                        });
+                        if (loginRes.ok) {
+                            window.location.href = '/';
+                        } else {
+                            setUI('login');
+                            showSuccess('注册成功，请手动登录');
+                        }
+                    } else if (mode === 'reset') {
+                        // 替换原有的alert，使用漂亮的提示框
+                        setUI('login');
+                        showSuccess('密码重置成功，请使用新密码登录');
+                        els.pwd.focus();
+                    }
+                } else { 
+                    throw new Error(data.error || '操作失败'); 
+                }
+            } catch (e) { 
+                showError(e.message);
+                if (mode === 'register') generateCaptcha();
+            } finally {
+                if (mode !== 'register' || document.hidden) {
+                     els.btn.innerText = originalText; 
+                     els.btn.disabled = false;
+                }
+            }
+        }
+
+        function showError(msg) {
+            els.error.innerText = msg;
+            els.error.style.display = 'block';
+            els.success.style.display = 'none'; // 互斥
+            els.error.style.animation = 'none';
+            els.error.offsetHeight;
+            els.error.style.animation = 'shake 0.5s cubic-bezier(.36,.07,.19,.97) both';
+        }
+        
+        function showSuccess(msg) {
+            els.success.innerText = msg;
+            els.success.style.display = 'block';
+            els.error.style.display = 'none'; // 互斥
+        }
+    </script>
+</body>
+</html>`;
+}
   
   function getHTML() {
     const iconBase64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48ZGVmcz48bGluZWFyR3JhZGllbnQgaWQ9ImEiIHgxPSIwIiB5MT0iMCIgeDI9IjUxMiIgeTI9IjUxMiIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzYzNjZmMSIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iI2E4NTVmNyIvPjwvbGluZWFyR3JhZGllbnQ+PC9kZWZzPjxyZWN0IHdpZHRoPSI1MTIiIGhlaWdodD0iNTEyIiByeD0iMTI4IiBmaWxsPSJ1cmwoI2EpIi8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTI1NiAxMjhsLTMyIDgwSDEyOGw4MCAzMi04MCAzMmg5NmwzMiA4MEwyNTYgNDAwTDI4OCAyNTZoOTZsMzItODBoLTk2ek0yNTYgMTkybDMyIDgwaDk2bDMyLTgwaC05NnoiLz48L3N2Zz4=";
@@ -623,7 +1109,7 @@ export default {
   <html lang="zh-CN">
   <head>
       <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
       <title>极光记账</title>
       <meta name="apple-mobile-web-app-capable" content="yes">
       <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -907,14 +1393,23 @@ export default {
               border-top: 1px solid rgba(255,255,255,0.1); 
               box-shadow: 0 -20px 60px rgba(0,0,0,0.7); 
               padding-bottom: max(32px, var(--safe-bottom)); 
+              
+              /* 关键修复样式 */
+              max-height: 90vh; /* 限制最大高度，防止键盘顶起时溢出 */
+              overflow-y: auto; /* 允许内部滚动 */
+              display: flex;
+              flex-direction: column;
           }
           [data-theme="light"] .modal-sheet { background: #fff; border-top-color: rgba(0,0,0,0.05); }
           .modal-sheet.active { transform: translateY(0); }
           
-          .sheet-handle { width: 48px; height: 5px; background: rgba(255,255,255,0.15); border-radius: 10px; margin: 0 auto 32px auto; }
+          .sheet-handle { width: 48px; height: 5px; background: rgba(255,255,255,0.15); border-radius: 10px; margin: 0 auto 32px auto; flex-shrink: 0; }
           [data-theme="light"] .sheet-handle { background: rgba(0,0,0,0.1); }
           
-          .segment-control { display: flex; background: rgba(0,0,0,0.3); padding: 5px; border-radius: 20px; margin-bottom: 28px; position: relative; }
+          /* 修复表单容器，允许其压缩 */
+          #addForm { flex: 1; display: flex; flex-direction: column; }
+          
+          .segment-control { display: flex; background: rgba(0,0,0,0.3); padding: 5px; border-radius: 20px; margin-bottom: 28px; position: relative; flex-shrink: 0; }
           [data-theme="light"] .segment-control { background: #f1f5f9; }
           .segment-btn { flex: 1; padding: 12px; text-align: center; font-weight: 700; color: var(--text-muted); border-radius: 16px; cursor: pointer; position: relative; z-index: 2; transition: 0.3s; font-size: 15px; }
           .segment-btn.active { color: white; }
@@ -944,7 +1439,7 @@ export default {
               font-size: 17px; font-weight: 700; 
               cursor: pointer; margin-top: 12px; 
               box-shadow: 0 10px 25px -5px rgba(255,255,255,0.2); 
-              transition: 0.2s; 
+              transition: 0.2s; flex-shrink: 0; /* 防止按钮变形 */
           }
           [data-theme="light"] .primary-btn { background: var(--primary); color: white; box-shadow: 0 10px 25px -5px rgba(99, 102, 241, 0.4); }
           .primary-btn:active { transform: scale(0.96); opacity: 0.9; }
@@ -1146,7 +1641,6 @@ export default {
               }
           });
   
-          // 主题切换逻辑
           function initTheme() {
               const savedTheme = localStorage.getItem('app_theme');
               if (savedTheme === 'light') {
@@ -1169,7 +1663,7 @@ export default {
                   localStorage.setItem('app_theme', 'light');
                   btn.textContent = '🌙';
               }
-              if (state.chartInstance) refreshChart(); // 刷新图表以适应新颜色
+              if (state.chartInstance) refreshChart(); 
           }
           window.toggleTheme = toggleTheme;
           
@@ -1198,6 +1692,15 @@ export default {
                   window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').then(reg => console.log('SW Registered')));
               }
               handleUrlShortcuts();
+              
+              // 修复: 给输入框添加监听，当键盘弹起时确保当前输入框可见
+              document.querySelectorAll('#addModal input, #addModal select').forEach(el => {
+                  el.addEventListener('focus', () => {
+                      setTimeout(() => {
+                          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                      }, 300); // 延时等待键盘完全弹起
+                  });
+              });
           }
   
           function toggleGroup(id) { 
@@ -1249,7 +1752,6 @@ export default {
               document.querySelectorAll('.nav-item').forEach(t => t.classList.remove('active')); 
               if (el) el.classList.add('active'); 
               
-              // --- 控制列表显示/隐藏逻辑 ---
               const listHeader = document.querySelector('.list-header-row');
               const listContainer = document.getElementById('list');
               
@@ -1287,7 +1789,6 @@ export default {
                const ctx = document.getElementById('dailyBalanceChart').getContext('2d');
                if (state.chartInstance) { state.chartInstance.destroy(); }
                
-               // 更高级的渐变色
                const gradientInc = ctx.createLinearGradient(0, 0, 0, 200); 
                gradientInc.addColorStop(0, '#34d399'); gradientInc.addColorStop(1, 'rgba(52, 211, 153, 0.2)');
                
@@ -1302,9 +1803,9 @@ export default {
                            label: '净流量', 
                            data: data.map(d => d.value), 
                            backgroundColor: data.map(d => d.value >= 0 ? gradientInc : gradientExp), 
-                           borderRadius: 100, // 完全圆角
+                           borderRadius: 100, 
                            borderSkipped: false,
-                           barThickness: 8, // 细长条
+                           barThickness: 8, 
                        }] 
                    }, 
                    options: { 
