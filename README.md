@@ -65,21 +65,56 @@ git remote add origin https://github.com/<你的用户名>/<仓库名>.git
 git push -u origin main
 ```
 
-### 第 2 步：在 Cloudflare 连接仓库
+### 第 2 步：在 Cloudflare 连接仓库（**选版本就在这一步**）
 
 1. 打开 [Cloudflare Dashboard](https://dash.cloudflare.com) → 左侧 **Workers & Pages**
-2. 点 **Create** → 选择 **Workers** 标签页 → **Connect to Git**
-3. 授权并选择刚才的仓库
-4. 填写构建设置：
+2. 点 **Create application** → 在 **Import a repository** 那一栏点 **Get started**
+3. 选 **Git account** → 从列表里选中你的仓库
+4. 进入 **Configure your project** 表单。**版本就是在这里选的**——关键只有两个字段：
 
-   | 配置项 | 填写内容 |
+   | 字段 | 个人版 | 多人注册版 |
+   | --- | --- | --- |
+   | **Project name** | `aurora-accounting` | `aurora-accounting-multi` |
+   | **Deploy command** | `npx wrangler deploy` | `npx wrangler deploy -c wrangler.multiplayer.jsonc` |
+
+   同一个表单里其余字段：
+
+   | 字段 | 填什么 |
    | --- | --- |
-   | Project name | 个人版填 `aurora-accounting`；多人版填 `aurora-accounting-multi`（**必须和所选配置文件里的 `name` 一致**） |
    | Build command | `npm install` |
-   | Deploy command | 个人版 `npx wrangler deploy`；多人版 `npx wrangler deploy -c wrangler.multiplayer.jsonc` |
    | Root directory | 留空（仓库根目录即项目根目录） |
+   | Build variables and secrets | 不用动 |
+   | API token | 保持默认（Cloudflare 自动生成） |
+
+   > ⚠️ **Project name 必须和所选配置文件里的 `name` 完全一致**，否则构建直接失败。
+   > 这是 Cloudflare 的硬性要求：Dashboard 里的 Worker 名称必须等于 wrangler 配置文件里的 `name`。
+   > 个人版对应 `wrangler.jsonc` 的 `aurora-accounting`，多人版对应
+   > `wrangler.multiplayer.jsonc` 的 `aurora-accounting-multi`。
 
 5. 点 **Save and Deploy**
+
+#### 两个版本都想部署？
+
+再走一遍上面 1–5 步就行：**同一个仓库**，换一组 **Project name** + **Deploy command**。
+两个 Worker 名称不同 → 自动创建两套独立的 KV / R2，互不干扰，可以同时在线。
+
+#### 建好之后想换版本？
+
+Worker → **Settings** → **Build** → 修改 **Deploy command** → 保存。
+
+注意两点：
+- 换版本时 **Project name 也要一起改**（要和目标配置文件的 `name` 对上），
+  但 Worker 名称在 Dashboard 里改不了，所以**换版本更推荐新建一个 Worker 项目**。
+- 构建设置**只对下一次构建生效**，改完要再推一次 commit，或在 Deployments 里点 **Retry build**。
+
+#### 记不住那串 `-c` 参数？
+
+也可以直接用 `package.json` 里的脚本当 Deploy command（Cloudflare 官方支持这种写法）：
+
+| 想部署 | Deploy command 也可以填 |
+| --- | --- |
+| 个人版 | `npm run deploy` |
+| 多人注册版 | `npm run deploy:multiplayer` |
 
 ### 第 3 步：看构建日志，确认资源被自动创建
 
