@@ -24,9 +24,17 @@ export default {
         if (path !== '/login' && !path.startsWith('/api/auth') && path !== '/manifest.json' && path !== '/sw.js') {
           const isAuthenticated = await checkAuthentication(request, env);
           if (!isAuthenticated) {
-            return new Response(getLoginPageHTML(), {
+            // API 请求返回 401 JSON，避免前端 fetch 拿到被重定向后的 HTML
+            if (path.startsWith('/api/')) {
+              return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+                status: 401,
+                headers: { 'Content-Type': 'application/json', ...securityHeaders },
+              });
+            }
+            // 页面请求 302 跳转到登录页（旧版本缺 Location 头，浏览器只能原地渲染 body）
+            return new Response(null, {
               status: 302,
-              headers: { 'Content-Type': 'text/html', ...securityHeaders },
+              headers: { 'Location': '/login', ...securityHeaders },
             });
           }
         }
@@ -69,7 +77,7 @@ export default {
   
         if (path === '/login') {
           return new Response(getLoginPageHTML(), {
-            headers: { 'Content-Type': 'text/html', ...securityHeaders },
+            headers: { 'Content-Type': 'text/html', 'Cache-Control': 'no-store', ...securityHeaders },
           });
         }
   
@@ -134,6 +142,42 @@ export default {
     }[char]));
   }
   
+  // 5. IP 频率限制（按用途分桶，互不影响）与统一错误响应
+  function clientIp(request) {
+    return request.headers.get('CF-Connecting-IP') || 'unknown';
+  }
+
+  async function readRateLimit(kv, ip, scope, max) {
+    const key = `limit_${scope}_${ip}`;
+    const attempts = parseInt(await kv.get(key) || '0', 10) || 0;
+    return { key: key, attempts: attempts, blocked: attempts >= max };
+  }
+
+  async function bumpRateLimit(kv, key, attempts, ttl = 900) {
+    await kv.put(key, String(attempts + 1), { expirationTtl: ttl });
+  }
+
+  function jsonError(message, status) {
+    return new Response(JSON.stringify({ error: message }), {
+      status: status,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  // 重置密码后作废该用户所有已登录的会话
+  async function revokeUserSessions(kv, userId) {
+    try {
+      const listed = await kv.list({ prefix: 'session_', limit: 200 });
+      for (const entry of listed.keys) {
+        const raw = await kv.get(entry.name);
+        if (!raw) continue;
+        try {
+          if (JSON.parse(raw).userId === userId) await kv.delete(entry.name);
+        } catch (e) { /* 跳过损坏记录 */ }
+      }
+    } catch (e) { /* 列表失败不影响主流程 */ }
+  }
+
   // --- 鉴权逻辑 ---
   async function checkAuthentication(request, env) {
     const cookieHeader = request.headers.get('Cookie') || '';
@@ -189,15 +233,30 @@ export default {
     // --- 1. 注册接口 (包含安全问题) ---
     if (path === '/api/auth/register' && method === 'POST') {
       try {
+        // 注册限流：防止脚本批量灌账号把 KV 写满
+        const ip = clientIp(request);
+        const regLimit = await readRateLimit(kv, ip, 'register', 20);
+        if (regLimit.blocked) return jsonError('注册过于频繁，请稍后再试', 429);
+        await bumpRateLimit(kv, regLimit.key, regLimit.attempts, 3600);
+
         const { username, password, question, answer } = await request.json();
         
-        if (!username || !password) return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400 });
-        if (!question || !answer) return new Response(JSON.stringify({ error: '请设置安全问题和答案，用于找回密码' }), { status: 400 });
+        if (!username || !password) return jsonError('请输入账号和密码', 400);
+        if (!question || !answer) return jsonError('请设置安全问题和答案，用于找回密码', 400);
         
-        const cleanUsername = sanitize(username); 
+        const cleanUsername = sanitize(String(username).trim());
+        if (cleanUsername.length < 3 || cleanUsername.length > 64) {
+          return jsonError('用户名长度需为 3-64 个字符', 400);
+        }
+        if (String(password).length < 6) {
+          return jsonError('密码至少需要 6 位', 400);
+        }
+        if (String(answer).trim().length < 2) {
+          return jsonError('安全问题答案太短', 400);
+        }
   
         const existingUser = await kv.get(`u_${cleanUsername}`);
-        if (existingUser) return new Response(JSON.stringify({ error: '用户名已存在' }), { status: 409 });
+        if (existingUser) return jsonError('用户名已存在', 409);
   
         // 1. 密码哈希
         const pwdResult = await hashPassword(password);
@@ -224,58 +283,88 @@ export default {
       }
     }
   
-    // --- 新增：获取安全问题 ---
+    // --- 获取安全问题 ---
     if (path === '/api/auth/get_question' && method === 'POST') {
         try {
+            const ip = clientIp(request);
+            const rl = await readRateLimit(kv, ip, 'question', 10);
+            if (rl.blocked) return jsonError('尝试次数过多，请15分钟后再试', 429);
+
             const { username } = await request.json();
-            const cleanUsername = sanitize(username);
+            const cleanUsername = sanitize(String(username || '').trim());
             const userStr = await kv.get(`u_${cleanUsername}`);
-            
-            if (!userStr) return new Response(JSON.stringify({ error: '用户不存在' }), { status: 404 });
-            
-            const userData = JSON.parse(userStr);
-            if (!userData.question) return new Response(JSON.stringify({ error: '该账号未设置安全问题' }), { status: 400 });
-            
+
+            // 统一失败响应：不再区分「用户不存在」和「未设置安全问题」，
+            // 否则这个接口可以被用来批量枚举哪些用户名已经注册
+            let userData = null;
+            if (userStr) {
+                try { userData = JSON.parse(userStr); } catch (e) { userData = null; }
+            }
+            if (!userData || !userData.question) {
+                await bumpRateLimit(kv, rl.key, rl.attempts);
+                return jsonError('账号不存在，或该账号未设置安全问题', 404);
+            }
+
+            await kv.delete(rl.key);
             return new Response(JSON.stringify({ question: userData.question }), { status: 200, headers: { 'Content-Type': 'application/json' } });
         } catch (e) {
-            return new Response(JSON.stringify({ error: '查询失败' }), { status: 500 });
+            return jsonError('查询失败', 500);
         }
     }
   
-    // --- 新增：通过安全问题重置密码 ---
+    // --- 通过安全问题重置密码 ---
     if (path === '/api/auth/reset_password' && method === 'POST') {
         try {
+            const ip = clientIp(request);
+            const rl = await readRateLimit(kv, ip, 'reset', 5);
+            if (rl.blocked) return jsonError('尝试次数过多，请15分钟后再试', 429);
+
             const { username, answer, newPassword } = await request.json();
-            const cleanUsername = sanitize(username);
-            
+            if (!newPassword || String(newPassword).length < 6) {
+                return jsonError('新密码至少需要 6 位', 400);
+            }
+
+            const cleanUsername = sanitize(String(username || '').trim());
             const userStr = await kv.get(`u_${cleanUsername}`);
-            if (!userStr) return new Response(JSON.stringify({ error: '用户不存在' }), { status: 404 });
-            
+            if (!userStr) {
+                await bumpRateLimit(kv, rl.key, rl.attempts);
+                return jsonError('账号不存在，或该账号未设置安全问题', 404);
+            }
+
             const userData = JSON.parse(userStr);
-            
+
             // 验证答案
             if (!userData.answerSalt || !userData.answerHash) {
-                return new Response(JSON.stringify({ error: '该账号不支持安全问题重置，请联系管理员' }), { status: 403 });
+                await bumpRateLimit(kv, rl.key, rl.attempts);
+                return jsonError('账号不存在，或该账号未设置安全问题', 404);
             }
-            
+
             const isAnswerCorrect = await verifyPassword(answer, userData.answerSalt, userData.answerHash);
-            
+
             if (!isAnswerCorrect) {
-                return new Response(JSON.stringify({ error: '安全问题答案错误' }), { status: 401 });
+                // 关键：答案错误也必须计数。旧版本这里不计数，
+                // 意味着可以无限次暴力猜测安全问题答案来接管账号。
+                await bumpRateLimit(kv, rl.key, rl.attempts);
+                return jsonError('安全问题答案错误', 401);
             }
-            
+
+            await kv.delete(rl.key);
+
             // 答案正确，重置密码
             const newPwdResult = await hashPassword(newPassword);
             userData.salt = newPwdResult.salt;
             userData.hash = newPwdResult.hash;
-            
+
+            // 改密后作废旧的登录会话，避免密码被盗后旧会话继续有效
+            await revokeUserSessions(kv, userData.userId);
+
             // 更新数据库
             await kv.put(`u_${cleanUsername}`, JSON.stringify(userData));
-            
+
             return new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-            
+
         } catch (e) {
-            return new Response(JSON.stringify({ error: e.message }), { status: 500 });
+            return jsonError(e.message, 500);
         }
     }
   
@@ -357,15 +446,25 @@ export default {
       }
       if (method === 'POST') {
         const rawTx = await request.json();
-        
+
+        // 入参校验：旧版本直接 parseFloat 就存，脏数据（NaN/负数/非法 type）
+        // 会被 JSON.stringify 静默变成 null，污染统计口径且难以排查。
+        if (rawTx.type !== 'income' && rawTx.type !== 'expense') {
+          return jsonError('类型只能是 income 或 expense', 400);
+        }
+        const amount = parseFloat(rawTx.amount);
+        if (!Number.isFinite(amount) || amount <= 0) {
+          return jsonError('金额必须是大于 0 的数字', 400);
+        }
+
         // **输入清洗**
         const transaction = {
             id: generateSecureToken(),
             timestamp: new Date().toISOString(),
             type: rawTx.type,
-            amount: parseFloat(rawTx.amount), 
-            category: sanitize(rawTx.category), 
-            description: sanitize(rawTx.description) 
+            amount: Math.round(amount * 100) / 100,
+            category: sanitize(String(rawTx.category || '默认').slice(0, 32)),
+            description: sanitize(String(rawTx.description || '').slice(0, 200))
         };
         
         const transactions = await getTransactionsFromR2(env, userId);
@@ -538,9 +637,8 @@ export default {
   
   function getServiceWorker() {
     return `
-  const CACHE_NAME = 'aurora-app-v31-secure';
+  const CACHE_NAME = 'aurora-app-v34-secure';
   const urlsToCache = [
-    '/', 
     '/manifest.json',
     'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js',
     'https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap'
@@ -555,39 +653,42 @@ export default {
   
   self.addEventListener('fetch', e => {
     const url = new URL(e.request.url);
-    const isApi = url.pathname.startsWith('/api/');
-    
-    if (urlsToCache.includes(url.pathname) || (url.origin === self.location.origin && urlsToCache.includes(url.pathname))) {
-        e.respondWith(caches.match(e.request).then(response => response || fetch(e.request)));
-        return;
-    }
-    
-    if (isApi) {
-        if (e.request.method !== 'GET') {
-             e.respondWith(fetch(e.request));
-             return;
-        }
+
+    // 1) API 请求一律不拦截、不缓存。
+    //    多人版尤其重要：同一台设备换账号登录后，旧版本会从缓存里
+    //    读到上一个人的账单，属于隐私泄漏。
+    if (url.pathname.startsWith('/api/')) return;
+
+    // 2) 非 GET 请求直接放行
+    if (e.request.method !== 'GET') return;
+
+    // 3) 页面导航：网络优先，离线时回退缓存
+    if (e.request.mode === 'navigate') {
         e.respondWith(
             fetch(e.request)
-                .then(response => {
-                    if (response.ok) {
-                        const responseClone = response.clone();
-                        caches.open(CACHE_NAME).then(cache => cache.put(e.request, responseClone));
-                    }
-                    return response;
+                .then(res => {
+                    const copy = res.clone();
+                    caches.open(CACHE_NAME).then(c => c.put(e.request, copy));
+                    return res;
                 })
-                .catch(() => {
-                    return caches.match(e.request).then(cachedResponse => {
-                        if (cachedResponse) return cachedResponse;
-                        return new Response(JSON.stringify({ error: 'Offline' }), { 
-                            status: 503, headers: { 'Content-Type': 'application/json' } 
-                        });
-                    });
-                })
+                .catch(() => caches.match(e.request).then(r => r || new Response('<h1>离线中</h1><p>请检查网络后重试。</p>', { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } })))
         );
         return;
     }
-    e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+
+    // 4) 静态资源与 CDN：缓存优先 + 后台静默更新
+    e.respondWith(
+        caches.match(e.request).then(cached => {
+            const network = fetch(e.request).then(res => {
+                if (res && (res.ok || res.type === 'opaque')) {
+                    const copy = res.clone();
+                    caches.open(CACHE_NAME).then(c => c.put(e.request, copy));
+                }
+                return res;
+            }).catch(() => cached);
+            return cached || network;
+        })
+    );
   });
   
   self.addEventListener('activate', e => {

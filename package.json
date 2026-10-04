@@ -1,0 +1,23 @@
+{
+  "name": "aurora-accounting",
+  "version": "1.0.0",
+  "private": true,
+  "description": "极光记账 · 基于 Cloudflare Workers + KV + R2 的个人记账 PWA（个人版 / 多人注册版）",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "dev:multiplayer": "wrangler dev -c wrangler.multiplayer.jsonc",
+    "deploy": "wrangler deploy",
+    "deploy:multiplayer": "wrangler deploy -c wrangler.multiplayer.jsonc",
+    "tail": "wrangler tail",
+    "tail:multiplayer": "wrangler tail -c wrangler.multiplayer.jsonc",
+    "check": "wrangler deploy --dry-run --outdir=.wrangler/dry-run",
+    "check:multiplayer": "wrangler deploy -c wrangler.multiplayer.jsonc --dry-run --outdir=.wrangler/dry-run-multi"
+  },
+  "devDependencies": {
+    "wrangler": "^4.147.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
