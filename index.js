@@ -347,15 +347,20 @@ export default {
       return { pass: false, warning: '', result };
     }
 
-    const reason = result.configError ? 'Secret Key 校验未通过' : '验证组件未通过';
-    console.warn(
-      '[turnstile] 已放行（' + (result.configError ? 'strict/配置错误' : 'lenient/宽松模式') + '）',
-      JSON.stringify({ codes: result.codes, mode })
-    );
+    // 放行时的告警：必须同时说清「因为什么放行」和「现在有多不安全」，
+    // 否则用户会以为验证码还好好地在保护自己。
+    const codes = result.codes.join(', ') || '无错误码';
+    let head;
+    if (result.configError) {
+      head = `⚠️ 人机验证未生效（严格模式自动放行：Secret Key 本身校验不通过）`;
+    } else {
+      head = `⚠️ 人机验证未生效（宽松模式：任何验证失败都放行）`;
+    }
+    // 也打到 Worker 日志里，方便 wrangler tail / Dashboard 排查
+    console.warn('[turnstile] 已放行', JSON.stringify({ mode, configError: result.configError, codes: result.codes }));
     return {
       pass: true,
-      warning: `⚠️ 人机验证未生效：${reason}（${result.codes.join(', ') || '无错误码'}）。` +
-        `${turnstileHint(result.codes)}。请到「系统设置」检查密钥。`,
+      warning: `${head}。错误码：${codes}。${turnstileHint(result.codes)}请到「系统设置」检查密钥，或切回严格模式。`,
       result,
     };
   }
