@@ -21,10 +21,7 @@ export default {
   
       try {
         // 路由守卫
-        // 注意：/api/turnstile/diagnose 必须放行 —— 它存在的意义就是给「还没登录、
-        // 而且正因为 Turnstile 配错而登不进来」的人用。若把它也拦在登录墙后面，
-        // 这个功能就彻底没用了。
-        if (path !== '/login' && path !== '/api/turnstile/diagnose' && !path.startsWith('/api/auth') && path !== '/manifest.json' && path !== '/sw.js') {
+        if (path !== '/login' && !path.startsWith('/api/auth') && path !== '/manifest.json' && path !== '/sw.js') {
           const isAuthenticated = await checkAuthentication(request, env);
           if (!isAuthenticated) {
             // API 请求：返回 401 JSON。
@@ -207,162 +204,28 @@ export default {
   //  7. Cloudflare Turnstile 验证
   //     以「系统设置里是否同时配好 Site Key 与 Secret Key」为开关。
   //     没配 → 自动关闭人机验证，保证一键部署后即可注册登录。
-  //
-  //  为什么这里要做「错误码分类」？
-  //    旧实现只返回 outcome.success，于是「密钥填错」和「用户没做验证」在
-  //    日志里长得一模一样，运维只看到一个 403，完全不知道去哪修。更糟的是，
-  //    密钥一旦填错，所有人都过不了验证 —— 包括管理员自己，于是连进「系统设置」
-  //    改回来的入口都被自己锁死了（先有鸡还是先有蛋）。
-  //
-  //  两类错误必须区别对待：
-  //    ① 配置类（CONFIG_CODES）：密钥本身无效。与请求方无关，任何人都不可能拿到
-  //       有效 token。此时继续拦截 = 对全站自我拒绝服务。→ 放行 + 大声告警。
-  //    ② 校验类：token 无效 / 过期 / 重复 / 缺失。密钥是好的，是这一次请求没过。
-  //       → 正常拦截，并把可读原因返回给前端。
   // ==========================================================================
-  const TURNSTILE_SITEVERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
-
-  // 服务端 siteverify 返回的「密钥本身有问题」类错误码
-  const TURNSTILE_CONFIG_CODES = ['missing-input-secret', 'invalid-input-secret', 'bad-request'];
-
-  // 错误码 → 中文修复指引。既用于服务端日志，也用于前端提示。
-  const TURNSTILE_HINTS = {
-    'missing-input-response': '请先完成人机验证',
-    'invalid-input-response': '人机验证未通过，请重新完成验证',
-    'timeout-or-duplicate': '验证已过期（验证码 5 分钟内有效且只能用一次），请重新完成验证',
-    'missing-input-secret': '服务端未配置 Secret Key',
-    'invalid-input-secret': 'Secret Key 无效：请确认它和 Site Key 来自同一个 Turnstile 组件，且没有填反或复制到多余空格',
-    'bad-request': 'Turnstile 请求被拒绝：Secret Key 格式不正确',
-    'internal-error': 'Cloudflare 侧临时故障，请稍后重试',
-    'network-error': '无法连接 Cloudflare 验证服务，请稍后重试',
-    // 客户端组件错误码（由 data-error-callback 上报，仅用于提示，不参与放行判断）
-    '110100': 'Site Key 无效：请检查是否复制完整、是否误填了 Secret Key',
-    '110110': 'Site Key 不存在：请确认它属于当前 Cloudflare 账号下的 Turnstile 组件',
-    '110200': '域名未授权：请到 Cloudflare Turnstile 控制台 → 该组件 → Hostname Management，把当前域名（含 *.workers.dev）加进去',
-    '110500': 'Site Key 类型不匹配：组件模式（托管/非交互/不可见）与当前用法不一致',
-    '110600': '验证挑战超时，请刷新页面重试',
-    '400020': 'Site Key 格式无效：请确认没有把 Secret Key 填到 Site Key 里',
-    '400021': '域名与 Site Key 不匹配：请检查 Hostname Management',
-    '400070': '该 Site Key 已被停用：请到 Cloudflare 控制台重新启用或更换组件',
-  };
-
-  function turnstileHint(codes) {
-    const list = Array.isArray(codes) ? codes : [codes];
-    for (const c of list) {
-      if (c && TURNSTILE_HINTS[c]) return TURNSTILE_HINTS[c];
-    }
-    const tail = list.filter(Boolean).join(', ');
-    return tail ? `人机验证失败（${tail}）` : '人机验证失败，请重试';
-  }
-
   function isTurnstileEnabled(settings) {
     return Boolean(settings && settings.turnstileSiteKey && settings.turnstileSecretKey);
   }
 
-  // 容错模式：
-  //   strict（默认）—— 只有「配置类错误」才放行。密钥填错/填反/过期时不会把
-  //                    管理员锁在门外，同时攻击者无法利用它绕过验证。
-  //   lenient       —— 任何验证失败都放行（仅记日志）。给还在调密钥的阶段用，
-  //                    会显著降低防护强度，界面上已明确标注。
-  function getTurnstileMode(settings) {
-    return settings && settings.turnstileMode === 'lenient' ? 'lenient' : 'strict';
-  }
-
-  async function callSiteVerify(secretKey, token, ip) {
+  async function verifyTurnstile(token, secretKey, ip) {
+    if (!secretKey) return true;   // 未配置密钥 → 视为通过
+    if (!token) return false;      // 配了密钥却没带 token → 拦截
     const formData = new FormData();
     formData.append('secret', secretKey);
-    formData.append('response', token || '');
-    if (ip && ip !== 'unknown') formData.append('remoteip', ip);
-
-    const result = await fetch(TURNSTILE_SITEVERIFY_URL, { method: 'POST', body: formData });
+    formData.append('response', token);
+    formData.append('remoteip', ip || '');
+  
+    const url = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
     try {
-      return await result.json();
+        const result = await fetch(url, { body: formData, method: 'POST' });
+        const outcome = await result.json();
+        return outcome.success;
     } catch (e) {
-      return { success: false, 'error-codes': ['bad-request'] };
+        console.error('Turnstile Verify Error:', e);
+        return false;
     }
-  }
-
-  /**
-   * @returns {Promise<{ok:boolean, skipped:boolean, codes:string[], configError:boolean}>}
-   */
-  async function verifyTurnstile(token, secretKey, ip) {
-    // 未配置密钥 → 人机验证整体关闭
-    if (!secretKey) return { ok: true, skipped: true, codes: [], configError: false };
-
-    // 没带 token：先用一个「必定无效」的探针 token 问 Cloudflare —— 这把密钥到底能不能用。
-    // 探针只反映密钥自身的有效性，与请求方是谁无关，因此攻击者无法靠伪造空 token
-    // 来把结果推向「放行」；而密钥真的坏掉时，我们也不会傻等着被自己锁死。
-    if (!token) {
-      try {
-        const probe = await callSiteVerify(secretKey, 'XXXX.DUMMY.TOKEN.XXXX', ip);
-        const probeCodes = probe['error-codes'] || [];
-        const secretBroken = probeCodes.some((c) => TURNSTILE_CONFIG_CODES.includes(c));
-        return {
-          ok: false,
-          skipped: false,
-          codes: secretBroken ? probeCodes : ['missing-input-response'],
-          configError: secretBroken,
-        };
-      } catch (e) {
-        // 连不上 Cloudflare 时不要把人挡在门外，交给调用方按 strict 规则处理
-        return { ok: false, skipped: false, codes: ['network-error'], configError: false };
-      }
-    }
-
-    try {
-      const outcome = await callSiteVerify(secretKey, token, ip);
-      const codes = outcome['error-codes'] || [];
-      const ok = Boolean(outcome.success);
-      return {
-        ok,
-        skipped: false,
-        codes,
-        configError: !ok && codes.some((c) => TURNSTILE_CONFIG_CODES.includes(c)),
-      };
-    } catch (e) {
-      console.error('[turnstile] siteverify 请求失败:', e && e.message);
-      return { ok: false, skipped: false, codes: ['network-error'], configError: false };
-    }
-  }
-
-  /**
-   * 统一裁决：返回 { pass, warning }。
-   * pass=true 表示本次请求可以继续；warning 非空时前端会弹一条醒目提示。
-   */
-  async function resolveTurnstile(cfToken, settings, ip, clientError) {
-    if (!isTurnstileEnabled(settings)) return { pass: true, warning: '', result: { skipped: true, codes: [] } };
-
-    const mode = getTurnstileMode(settings);
-    const result = await verifyTurnstile(cfToken, settings.turnstileSecretKey, ip);
-
-    if (clientError) {
-      // 只记日志。客户端上报的错误码可被伪造，绝不参与放行判断。
-      console.warn('[turnstile] 客户端组件错误码:', String(clientError).slice(0, 32));
-    }
-
-    if (result.ok) return { pass: true, warning: '', result };
-
-    // 校验类失败：密钥是好的，就是这次没过 → 拦截（宽松模式除外）
-    if (!result.configError && mode !== 'lenient') {
-      return { pass: false, warning: '', result };
-    }
-
-    // 放行时的告警：必须同时说清「因为什么放行」和「现在有多不安全」，
-    // 否则用户会以为验证码还好好地在保护自己。
-    const codes = result.codes.join(', ') || '无错误码';
-    let head;
-    if (result.configError) {
-      head = `⚠️ 人机验证未生效（严格模式自动放行：Secret Key 本身校验不通过）`;
-    } else {
-      head = `⚠️ 人机验证未生效（宽松模式：任何验证失败都放行）`;
-    }
-    // 也打到 Worker 日志里，方便 wrangler tail / Dashboard 排查
-    console.warn('[turnstile] 已放行', JSON.stringify({ mode, configError: result.configError, codes: result.codes }));
-    return {
-      pass: true,
-      warning: `${head}。错误码：${codes}。${turnstileHint(result.codes)}请到「系统设置」检查密钥，或切回严格模式。`,
-      result,
-    };
   }
   
   // --- 鉴权逻辑 ---
@@ -420,7 +283,7 @@ export default {
     // --- 1. 注册接口 ---
     if (path === '/api/auth/register' && method === 'POST') {
       try {
-        const { username, password, cfToken, cfError } = await request.json();
+        const { username, password, cfToken } = await request.json();
         if (!username || !password) return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 
         const cleanUsername = sanitize(String(username).trim());
@@ -431,24 +294,14 @@ export default {
           return new Response(JSON.stringify({ error: '密码至少需要 6 位' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
-        // 注册频率限制：既是防批量注册，也顺带限制 Turnstile 探针被反复触发
-        const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-        const regLimitKey = `reglimit_${ip}`;
-        const regAttempts = parseInt((await kv.get(regLimitKey)) || '0');
-        if (regAttempts >= 10) {
-          return new Response(JSON.stringify({ error: '注册过于频繁，请 1 小时后再试' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
-        }
-
         // Turnstile 验证（系统设置里没配密钥时自动跳过）
+        const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
         const settings = await getSystemSettings(env);
-        const ts = await resolveTurnstile(cfToken, settings, ip, cfError);
-        if (!ts.pass) {
-          await kv.put(regLimitKey, String(regAttempts + 1), { expirationTtl: 3600 });
-          return new Response(JSON.stringify({
-            error: turnstileHint(ts.result.codes),
-            code: 'turnstile_failed',
-            turnstile: { codes: ts.result.codes },
-          }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+        if (isTurnstileEnabled(settings)) {
+          const isHuman = await verifyTurnstile(cfToken, settings.turnstileSecretKey, ip);
+          if (!isHuman) {
+               return new Response(JSON.stringify({ error: '人机验证失败，请刷新重试' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+          }
         }
 
         const existingUser = await kv.get(`u_${cleanUsername}`);
@@ -477,10 +330,7 @@ export default {
         const token = generateSecureToken();
         await kv.put(`session_${token}`, JSON.stringify({ userId, username: cleanUsername }), { expirationTtl: 86400 });
 
-        // 注册也计入频率限制，避免同一 IP 反复刷号
-        await kv.put(regLimitKey, String(regAttempts + 1), { expirationTtl: 3600 });
-
-        return new Response(JSON.stringify({ success: true, token, warning: ts.warning || undefined }), {
+        return new Response(JSON.stringify({ success: true, token }), {
           status: 200,
           headers: {
             'Content-Type': 'application/json',
@@ -494,31 +344,27 @@ export default {
   
     // --- 2. 登录接口 ---
     if (path === '/api/auth/login' && method === 'POST') {
-      const { username, password, cfToken, cfError } = await request.json();
+      // 1. 从请求体获取 cfToken
+      const { username, password, cfToken } = await request.json();
       if (!username || !password) return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
   
       const cleanUsername = sanitize(String(username).trim());
       const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
       const rateLimitKey = `limit_${ip}`;
+      const settings = await getSystemSettings(env);
+      
+      // 2. 先验证 Turnstile (系统设置里没配密钥时自动跳过)
+      if (isTurnstileEnabled(settings)) {
+          const isHuman = await verifyTurnstile(cfToken, settings.turnstileSecretKey, ip);
+          if (!isHuman) {
+               return new Response(JSON.stringify({ error: '验证失败，请刷新验证码' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+          }
+      }
 
-      // 防暴力破解检测：先查限流再打 Turnstile，避免攻击者用「不带 token 的请求」
-      // 反复触发 siteverify 探针，把验证服务当成放大器。
+      // 防暴力破解检测 (保留 IP 频率限制作为第二道防线)
       let attempts = parseInt(await kv.get(rateLimitKey) || '0');
       if (attempts >= 5) {
           return new Response(JSON.stringify({ error: '尝试次数过多，请15分钟后再试' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      // Turnstile 验证（系统设置里没配密钥时自动跳过）
-      const settings = await getSystemSettings(env);
-      const ts = await resolveTurnstile(cfToken, settings, ip, cfError);
-      if (!ts.pass) {
-          // 验证失败同样计入 IP 限流，防止无限重试
-          await kv.put(rateLimitKey, (attempts + 1).toString(), { expirationTtl: 900 });
-          return new Response(JSON.stringify({
-            error: turnstileHint(ts.result.codes),
-            code: 'turnstile_failed',
-            turnstile: { codes: ts.result.codes },
-          }), { status: 403, headers: { 'Content-Type': 'application/json' } });
       }
   
       const userStr = await kv.get(`u_${cleanUsername}`);
@@ -537,7 +383,7 @@ export default {
           const token = generateSecureToken();
           await kv.put(`session_${token}`, JSON.stringify({ userId: userData.userId, username: cleanUsername }), { expirationTtl: 86400 });
           
-          return new Response(JSON.stringify({ success: true, token, warning: ts.warning || undefined }), {
+          return new Response(JSON.stringify({ success: true, token }), {
             status: 200,
             headers: { 
               'Content-Type': 'application/json',
@@ -566,70 +412,6 @@ export default {
       });
     }
   
-    // --- 3.5 Turnstile 自检（无需登录） ---
-    //  存在的唯一理由：Turnstile 一旦配错，所有人都进不来 —— 包括管理员。
-    //  这时候需要一个「不需要登录也能问清楚到底哪里错了」的入口，否则只能去
-    //  Cloudflare 控制台翻日志。返回内容不含任何密钥明文，且按 IP 限流。
-    if (path === '/api/turnstile/diagnose' && method === 'GET') {
-      const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-      const dk = `diaglimit_${ip}`;
-      const hits = parseInt((await kv.get(dk)) || '0');
-      if (hits >= 10) {
-        return new Response(JSON.stringify({ error: '自检过于频繁，请 15 分钟后再试' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
-      }
-      await kv.put(dk, String(hits + 1), { expirationTtl: 900 });
-
-      const s = await getSystemSettings(env);
-      const enabled = isTurnstileEnabled(s);
-      const mode = getTurnstileMode(s);
-      const host = new URL(request.url).host;
-
-      const payload = {
-        enabled,
-        mode,
-        host,
-        siteKey: s.turnstileSiteKey ? maskSecret(s.turnstileSiteKey) : '',
-        secretKey: s.turnstileSecretKey ? maskSecret(s.turnstileSecretKey) : '',
-        secretKeyValid: null,
-        serverCodes: [],
-        verdict: 'not-configured',
-        message: '',
-        suggestions: [],
-      };
-
-      if (!enabled) {
-        payload.message = '未配置 Turnstile：人机验证当前处于关闭状态，任何人都可以直接注册登录。';
-        payload.suggestions.push('如需开启，请在「系统设置」中同时填入 Site Key 与 Secret Key。');
-      } else {
-        // 用探针 token 询问 Cloudflare：这把 Secret Key 本身是否可用
-        let probe = {};
-        try {
-          probe = await callSiteVerify(s.turnstileSecretKey, 'XXXX.DUMMY.TOKEN.XXXX', ip);
-        } catch (e) {
-          probe = { success: false, 'error-codes': ['network-error'] };
-        }
-        const codes = probe['error-codes'] || [];
-        const secretBroken = codes.some((c) => TURNSTILE_CONFIG_CODES.includes(c));
-        payload.serverCodes = codes;
-        payload.secretKeyValid = !secretBroken;
-
-        if (secretBroken) {
-          payload.verdict = 'secret-invalid';
-          payload.message = 'Secret Key 校验未通过，人机验证不可能通过。当前模式下系统会自动放行以免把管理员锁在门外。';
-          payload.suggestions.push('确认 Site Key 与 Secret Key 来自同一个 Turnstile 组件，且没有填反。');
-          payload.suggestions.push('在 Cloudflare 控制台重新生成一组密钥后，到「系统设置」覆盖保存。');
-        } else {
-          payload.verdict = 'secret-ok';
-          payload.message = 'Secret Key 有效。如果浏览器里验证码显示 Troubleshoot，问题出在组件侧的域名或 Site Key 配置上。';
-          payload.suggestions.push('到 Cloudflare 控制台 → Turnstile → 该组件 → Hostname Management，把 ' + host + ' 加入允许列表（*.workers.dev 也要单独添加）。');
-          payload.suggestions.push('确认 Site Key 与 Secret Key 没有填反：Site Key 会渲染到页面，Secret Key 只留在服务端。');
-          payload.suggestions.push('若组件使用「不可见模式（Invisible）」，需改用托管模式或手动执行 turnstile.execute()。');
-        }
-      }
-
-      return new Response(JSON.stringify(payload), { headers: { 'Content-Type': 'application/json' } });
-    }
-
     const currentUser = await getCurrentUser(request, env);
     if (!currentUser) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
@@ -659,7 +441,6 @@ export default {
           turnstileSecretKeySet: Boolean(s.turnstileSecretKey),
           turnstileSecretKeyMasked: maskSecret(s.turnstileSecretKey),
           turnstileEnabled: isTurnstileEnabled(s),
-          turnstileMode: getTurnstileMode(s),
           updatedAt: s.updatedAt || null,
           updatedBy: s.updatedBy || null
         }), { headers: { 'Content-Type': 'application/json' } });
@@ -680,27 +461,17 @@ export default {
           secretKey = String(body.turnstileSecretKey).trim().slice(0, 256);
         }
 
-        // 容错模式：不传则沿用旧值，非法值一律回落到 strict
-        const mode = body.turnstileMode === undefined
-          ? getTurnstileMode(s)
-          : (body.turnstileMode === 'lenient' ? 'lenient' : 'strict');
-
         if (siteKey && !secretKey) {
           return new Response(JSON.stringify({ error: '只填了 Site Key：Secret Key 也必须填，否则验证码无法通过校验' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
         if (!siteKey && secretKey) {
           return new Response(JSON.stringify({ error: '只填了 Secret Key：Site Key 也必须填' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
-        // 两把密钥填反是「Troubleshoot / 无法登录」最常见的成因之一，这里直接拦掉
-        if (siteKey && secretKey && siteKey === secretKey) {
-          return new Response(JSON.stringify({ error: 'Site Key 与 Secret Key 完全相同：它们来自同一个组件的不同字段，请勿填反' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-        }
 
         const next = {
           ...s,
           turnstileSiteKey: siteKey,
           turnstileSecretKey: secretKey,
-          turnstileMode: mode,
           updatedAt: Date.now(),
           updatedBy: currentUser.username
         };
@@ -712,7 +483,6 @@ export default {
           turnstileSecretKeySet: Boolean(next.turnstileSecretKey),
           turnstileSecretKeyMasked: maskSecret(next.turnstileSecretKey),
           turnstileEnabled: isTurnstileEnabled(next),
-          turnstileMode: getTurnstileMode(next),
           updatedAt: next.updatedAt,
           updatedBy: next.updatedBy
         }), { headers: { 'Content-Type': 'application/json' } });
@@ -1073,7 +843,7 @@ export default {
       <link rel="manifest" href="/manifest.json">
       <link rel="apple-touch-icon" href="${iconBase64}">
       <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
-      ${turnstileEnabled ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=onTurnstileApiLoad" async defer></script>' : '<!-- Turnstile 未配置：人机验证已自动关闭 -->'}
+      ${turnstileEnabled ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : '<!-- Turnstile 未配置：人机验证已自动关闭 -->'}
       <style>
           :root { --primary: #8b5cf6; --bg: #020617; --text: #f8fafc; }
           body { margin: 0; font-family: 'Plus Jakarta Sans', system-ui, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; background-color: var(--bg); color: var(--text); overflow: hidden; position: relative; }
@@ -1139,8 +909,6 @@ export default {
           .switch-mode:hover { color: white; text-decoration: underline; }
           
           .error { color: #f43f5e; font-size: 14px; margin-bottom: 20px; display: none; background: rgba(244,63,94,0.15); padding: 12px; border-radius: 16px; animation: shake 0.5s cubic-bezier(.36,.07,.19,.97) both; }
-          /* 容错放行时的告警态：不是错误，但必须让人看见「防护没生效」 */
-          .error.warn { color: #fbbf24; background: rgba(251,191,36,0.15); }
           @keyframes shake { 10%, 90% { transform: translate3d(-1px, 0, 0); } 20%, 80% { transform: translate3d(2px, 0, 0); } 30%, 50%, 70% { transform: translate3d(-4px, 0, 0); } 40%, 60% { transform: translate3d(4px, 0, 0); } }
           
           /* 隐藏注册专用字段 */
@@ -1167,77 +935,17 @@ export default {
                   <input type="password" id="pwd-confirm" placeholder="再次输入密码" autocomplete="new-password">
               </div>
               
-              ${turnstileEnabled ? '<div id="group-turnstile"><div class="cf-turnstile"></div></div>' : ''}
+              ${turnstileEnabled ? '<div id="group-turnstile"><div class="cf-turnstile" data-sitekey="' + turnstileSiteKey + '" data-theme="dark"></div></div>' : ''}
   
               <button type="submit" id="btn">立即登录</button>
           </form>
           
           <div class="switch-mode" id="switchBtn" onclick="toggleMode()">没有账号？点击注册</div>
-          <div id="diagBtn" onclick="runDiagnose()" style="margin-top:14px;font-size:12px;color:#64748b;cursor:pointer;text-decoration:underline;">验证码显示 Troubleshoot / 加载不出来？点此自检</div>
-          <div id="diagResult" style="display:none;margin-top:14px;padding:14px;border-radius:16px;background:rgba(0,0,0,0.35);border:1px solid rgba(255,255,255,0.08);font-size:12px;line-height:1.8;color:#cbd5e1;text-align:left;word-break:break-word;"></div>
       </div>
   
       <script>
           let isLogin = true;
           const TURNSTILE_ENABLED = ${turnstileEnabled};
-          const TURNSTILE_SITEKEY = ${JSON.stringify(turnstileSiteKey)};
-
-          // ------------------------------------------------------------------
-          //  Turnstile 组件级错误处理
-          //  之前只写了 data-sitekey，组件出问题时页面上只有一句 "Troubleshoot"，
-          //  用户和运维都不知道发生了什么。这里把组件回调的错误码接住并翻译成
-          //  中文修复指引 —— 最常见的 110200 就是「域名没加进 Hostname Management」。
-          // ------------------------------------------------------------------
-          const TS_HINTS = {
-              '110100': 'Site Key 无效：请检查是否复制完整，或误把 Secret Key 填到了 Site Key 里。',
-              '110110': 'Site Key 不存在：请确认它属于当前 Cloudflare 账号下的 Turnstile 组件。',
-              '110200': '域名未授权：请到 Cloudflare 控制台 → Turnstile → 该组件 → Hostname Management，把当前域名（*.workers.dev 也要单独加）加进允许列表。',
-              '110500': 'Site Key 类型不匹配：组件模式（托管/非交互/不可见）与当前用法不一致。',
-              '110600': '验证挑战超时，请刷新页面重试。',
-              '110420': '验证组件初始化失败，请刷新页面重试。',
-              '400020': 'Site Key 格式无效：请确认没有把 Secret Key 填到 Site Key 的位置。',
-              '400021': '域名与 Site Key 不匹配：请检查 Hostname Management。',
-              '400070': '该 Site Key 已被停用：请到 Cloudflare 控制台重新启用或更换组件。'
-          };
-
-          let tsWidgetId = null;
-          let tsErrorCode = '';
-
-          function tsHint(code) {
-              const key = String(code || '');
-              return TS_HINTS[key] || ('人机验证组件异常（错误码 ' + key + '），请点击下方「自检」查看原因。');
-          }
-
-          function onTurnstileError(code) {
-              tsErrorCode = String(code || 'unknown');
-              showError(tsHint(tsErrorCode));
-          }
-
-          // Turnstile 脚本加载完成后由 ?onload= 回调触发
-          function onTurnstileApiLoad() {
-              if (!TURNSTILE_ENABLED) return;
-              const el = document.querySelector('.cf-turnstile');
-              if (!el || !window.turnstile) return;
-              try {
-                  tsWidgetId = window.turnstile.render(el, {
-                      sitekey: TURNSTILE_SITEKEY,
-                      theme: 'dark',
-                      callback: function () { tsErrorCode = ''; },
-                      'error-callback': onTurnstileError,
-                      'timeout-callback': function () { onTurnstileError('110600'); },
-                      'expired-callback': function () { tsErrorCode = ''; }
-                  });
-              } catch (e) {
-                  onTurnstileError('render-failed');
-              }
-          }
-          window.onTurnstileApiLoad = onTurnstileApiLoad;
-
-          function resetTurnstile() {
-              if (window.turnstile && tsWidgetId !== null) {
-                  try { window.turnstile.reset(tsWidgetId); } catch (e) { /* 组件可能已卸载 */ }
-              }
-          }
   
           const els = {
               title: document.getElementById('title'),
@@ -1274,7 +982,7 @@ export default {
                   els.regFields.forEach(el => el.style.display = 'block');
               }
               // 切换模式时重置验证码
-              resetTurnstile();
+              if (window.turnstile) turnstile.reset();
               els.username.focus();
           }
   
@@ -1298,13 +1006,9 @@ export default {
   
               // 2. 获取 Turnstile Token（仅在后端已配置 Turnstile 时才要求）
               if (TURNSTILE_ENABLED) {
-                  cfToken = (window.turnstile && tsWidgetId !== null)
-                      ? (window.turnstile.getResponse(tsWidgetId) || '')
-                      : (new FormData(els.form).get('cf-turnstile-response') || '');
+                  cfToken = new FormData(els.form).get('cf-turnstile-response') || '';
                   if (!cfToken) {
-                      // 组件自己报过错 → 直接显示它给的修复指引，别再说「请完成人机验证」，
-                      // 那句话会把「组件坏了」误导成「用户没点」。
-                      showError(tsErrorCode ? tsHint(tsErrorCode) : '请先完成上方的人机验证');
+                      showError('请完成人机验证');
                       return;
                   }
               }
@@ -1319,7 +1023,7 @@ export default {
                   const res = await fetch(endpoint, { 
                       method: 'POST', 
                       headers: { 'Content-Type': 'application/json' }, 
-                      body: JSON.stringify({ username, password, cfToken, cfError: tsErrorCode || undefined }) 
+                      body: JSON.stringify({ username, password, cfToken }) 
                   });
                   
                   const data = await res.json();
@@ -1327,102 +1031,26 @@ export default {
                   if (res.ok) {
                       // 注册接口现在会直接下发登录 Cookie，无需再调一次登录接口
                       els.btn.innerText = isLogin ? '验证成功' : '注册成功';
-                      if (data.warning) {
-                          // 服务端因为「Turnstile 配置错误」容错放行了。防护此刻是失效的，
-                          // 必须让操作者立刻知道，否则会误以为自己在受保护状态。
-                          try { sessionStorage.setItem('aurora_warning', data.warning); } catch (err) {}
-                          showWarn(data.warning);
-                          setTimeout(function () { window.location.href = '/'; }, 2600);
-                          return;
-                      }
                       window.location.href = '/';
                   } else { 
-                      // 把服务端返回的错误码一起带上，方便用户对照文档排障
-                      const suffix = (data.turnstile && data.turnstile.codes && data.turnstile.codes.length)
-                          ? '（' + data.turnstile.codes.join(', ') + '）' : '';
-                      throw new Error((data.error || (isLogin ? '登录失败' : '注册失败')) + suffix); 
+                      throw new Error(data.error || (isLogin ? '登录失败' : '注册失败')); 
                   }
               } catch (e) { 
                   showError(e.message);
                   els.btn.innerText = originalText; 
                   els.btn.disabled = false; 
                   // 失败后重置验证码
-                  resetTurnstile();
+                  if (window.turnstile) turnstile.reset();
               }
           }
   
           function showError(msg) {
-              els.error.classList.remove('warn');
               els.error.innerText = msg;
               els.error.style.display = 'block';
               // 简单的震动反馈
               els.error.style.animation = 'none';
               els.error.offsetHeight; /* trigger reflow */
               els.error.style.animation = 'shake 0.5s cubic-bezier(.36,.07,.19,.97) both';
-          }
-
-          function showWarn(msg) {
-              els.error.classList.add('warn');
-              els.error.innerText = msg;
-              els.error.style.display = 'block';
-          }
-
-          // ------------------------------------------------------------------
-          //  自检：不需要登录，也不需要看懂 Cloudflare 日志
-          // ------------------------------------------------------------------
-          function escapeHtml(s) {
-              return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-                  return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-              });
-          }
-
-          async function runDiagnose() {
-              const box = document.getElementById('diagResult');
-              box.style.display = 'block';
-              box.innerText = '自检中...';
-              try {
-                  const res = await fetch('/api/turnstile/diagnose');
-                  const d = await res.json();
-                  if (!res.ok) { box.innerText = d.error || '自检失败'; return; }
-
-                  const lines = [];
-                  lines.push('<b>状态：</b>' + (d.enabled ? '已开启' : '未开启')
-                      + '（容错模式：' + (d.mode === 'lenient' ? '宽松' : '严格') + '）');
-                  lines.push('<b>当前域名：</b>' + escapeHtml(d.host));
-                  if (d.siteKey) lines.push('<b>Site Key：</b>' + escapeHtml(d.siteKey));
-                  if (d.secretKey) lines.push('<b>Secret Key：</b>' + escapeHtml(d.secretKey));
-                  if (d.enabled) {
-                      lines.push('<b>Secret Key 有效性：</b>' + (d.secretKeyValid ? '✅ 有效' : '❌ 无效'));
-                  }
-                  if (d.serverCodes && d.serverCodes.length) {
-                      lines.push('<b>服务端错误码：</b>' + escapeHtml(d.serverCodes.join(', ')));
-                  }
-                  if (tsErrorCode) {
-                      lines.push('<b>浏览器组件错误码：</b>' + escapeHtml(tsErrorCode));
-                      lines.push('<b>组件问题：</b>' + escapeHtml(tsHint(tsErrorCode)));
-                  }
-                  lines.push('<b>结论：</b>' + escapeHtml(d.message));
-                  if (d.suggestions && d.suggestions.length) {
-                      lines.push('<b>修复建议：</b>');
-                      d.suggestions.forEach(function (s, i) {
-                          lines.push((i + 1) + '. ' + escapeHtml(s));
-                      });
-                  }
-                  box.innerHTML = lines.join('<br>');
-              } catch (e) {
-                  box.innerText = '网络错误：' + e.message;
-              }
-          }
-          window.runDiagnose = runDiagnose;
-
-          // 脚本被 CSP / 网络 / 广告拦截插件干掉时，onload 回调永远不会触发，
-          // 页面上只会留一个空白方块。兜底提示一下，别让人对着空白发呆。
-          if (TURNSTILE_ENABLED) {
-              setTimeout(function () {
-                  if (tsWidgetId === null && !tsErrorCode) {
-                      onTurnstileError('script-blocked');
-                  }
-              }, 8000);
           }
       </script>
   </body>
@@ -1836,13 +1464,6 @@ export default {
                   <button class="logout-btn" onclick="logout()">退出</button>
               </div>
           </header>
-
-          <div id="sysWarnBanner" style="display:none;margin-top:14px;padding:14px 16px;border-radius:18px;background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.35);color:#fbbf24;font-size:13px;line-height:1.7;">
-              <div style="display:flex;gap:10px;align-items:flex-start;">
-                  <span style="flex:1;word-break:break-word;" id="sysWarnText"></span>
-                  <span onclick="dismissSysWarn()" style="cursor:pointer;opacity:0.65;flex-shrink:0;">✕</span>
-              </div>
-          </div>
   
           <div class="summary-card glass">
               <div class="balance-label">总资产净值</div>
@@ -1967,27 +1588,9 @@ export default {
               <input type="password" id="setSecretKey" class="modern-input" placeholder="未配置" autocomplete="new-password" spellcheck="false">
           </div>
 
-          <div style="margin-bottom:12px;">
-              <div class="stat-title" style="margin-bottom:8px;">容错模式</div>
-              <div style="display:flex;gap:8px;">
-                  <label style="flex:1;display:flex;align-items:center;gap:6px;padding:10px 12px;border-radius:14px;background:rgba(0,0,0,0.2);border:1px solid var(--border-glass);font-size:13px;cursor:pointer;">
-                      <input type="radio" name="tsMode" value="strict" onchange="saveMode('strict')" style="width:auto;"> 严格（推荐）
-                  </label>
-                  <label style="flex:1;display:flex;align-items:center;gap:6px;padding:10px 12px;border-radius:14px;background:rgba(0,0,0,0.2);border:1px solid var(--border-glass);font-size:13px;cursor:pointer;">
-                      <input type="radio" name="tsMode" value="lenient" onchange="saveMode('lenient')" style="width:auto;"> 宽松（调试）
-                  </label>
-              </div>
-              <div style="font-size:11px;color:var(--text-muted);line-height:1.7;margin-top:8px;">
-                  <b>严格</b>：只有「Secret Key 本身无效」这类配置错误才放行 —— 密钥填错/填反时不会把自己锁在门外，同时攻击者也无法借此绕过验证。<br>
-                  <b>宽松</b>：任何验证失败都放行，<b>会显著降低防护强度</b>，仅建议在调试密钥时临时开启。
-              </div>
-          </div>
-
           <div id="settingsHint" style="font-size:12px;color:var(--text-muted);min-height:20px;margin-bottom:16px;"></div>
 
           <button type="button" class="primary-btn" id="settingsSaveBtn" onclick="saveSettings()">保存设置</button>
-          <button type="button" id="settingsDiagBtn" onclick="runSettingsDiagnose()" style="width:100%;padding:16px;margin-top:12px;border-radius:22px;background:rgba(255,255,255,0.06);border:1px solid var(--border-glass);color:var(--text);font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;">运行自检</button>
-          <div id="settingsDiagResult" style="display:none;margin-top:12px;padding:14px;border-radius:16px;background:rgba(0,0,0,0.25);border:1px solid var(--border-glass);font-size:12px;line-height:1.8;color:var(--text-muted);text-align:left;word-break:break-word;"></div>
           <button type="button" id="settingsClearBtn" onclick="clearSettings()" style="width:100%;padding:16px;margin-top:12px;border-radius:22px;background:transparent;border:1px solid var(--danger);color:var(--danger);font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;">关闭验证码（清空密钥）</button>
       </div>
 
@@ -2066,7 +1669,7 @@ export default {
   
           function init() {
               initTheme();
-              updateCategoryOptions(); setType('income'); loadData(); loadMe(); consumeLoginWarning();
+              updateCategoryOptions(); setType('income'); loadData(); loadMe();
               if ('serviceWorker' in navigator) {
                   window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').then(reg => console.log('SW Registered')));
               }
@@ -2097,30 +1700,6 @@ export default {
           }
   
           function vibrate() { if (window.navigator.vibrate) window.navigator.vibrate(50); }
-
-          // 登录/注册时服务端因 Turnstile 配置错误而容错放行 → 在这里把告警顶出来。
-          // 只提示一次，用户手动关掉即视为已知晓。
-          function showSysWarn(msg) {
-              const b = document.getElementById('sysWarnBanner');
-              if (!b) return;
-              document.getElementById('sysWarnText').innerText = msg;
-              b.style.display = 'block';
-          }
-          function dismissSysWarn() {
-              const b = document.getElementById('sysWarnBanner');
-              if (b) b.style.display = 'none';
-              try { sessionStorage.removeItem('aurora_warning'); } catch (e) {}
-          }
-          window.dismissSysWarn = dismissSysWarn;
-
-          function consumeLoginWarning() {
-              let msg = '';
-              try {
-                  msg = sessionStorage.getItem('aurora_warning') || '';
-                  sessionStorage.removeItem('aurora_warning');
-              } catch (e) { return; }
-              if (msg) showSysWarn(msg);
-          }
           function openAddModal() { document.getElementById('addModal').classList.add('active'); document.getElementById('overlay').classList.add('active'); document.getElementById('amount').focus(); vibrate(); }
           function closeAll() { document.getElementById('addModal').classList.remove('active'); document.getElementById('deleteModal').classList.remove('active'); document.getElementById('settingsModal').classList.remove('active'); document.getElementById('overlay').classList.remove('active'); if (pendingDelete) { pendingDelete.content.style.transform = 'translateX(0)'; pendingDelete = null; } }
           function openDeleteModal(id, element, content) { pendingDelete = { id, element, content }; document.getElementById('deleteModal').classList.add('active'); document.getElementById('overlay').classList.add('active'); vibrate(); }
@@ -2357,60 +1936,6 @@ export default {
                   ? ('已配置：' + d.turnstileSecretKeyMasked + '（留空则不修改）')
                   : '未配置';
               document.getElementById('settingsStatus').innerText = d.turnstileEnabled ? '✅ 已开启' : '⚪ 未开启';
-
-              const mode = d.turnstileMode === 'lenient' ? 'lenient' : 'strict';
-              document.querySelectorAll('input[name="tsMode"]').forEach(function (r) {
-                  r.checked = (r.value === mode);
-              });
-          }
-
-          async function saveMode(mode) {
-              const hint = document.getElementById('settingsHint');
-              try {
-                  const res = await fetch('/api/settings', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ turnstileMode: mode })
-                  });
-                  const d = await res.json();
-                  if (!res.ok) throw new Error(d.error || '保存失败');
-                  renderSettingsState(d);
-                  hint.innerText = mode === 'lenient'
-                      ? '已切换为宽松模式：验证失败也会放行，防护强度降低。'
-                      : '已切换为严格模式：只有密钥本身失效时才放行。';
-                  vibrate();
-              } catch (e) {
-                  hint.innerText = e.message;
-              }
-          }
-
-          // 设置页里的自检：不用退出登录，管理员原地就能看到结论
-          async function runSettingsDiagnose() {
-              const box = document.getElementById('settingsDiagResult');
-              const btn = document.getElementById('settingsDiagBtn');
-              box.style.display = 'block';
-              box.innerText = '自检中...';
-              btn.disabled = true;
-              try {
-                  const res = await fetch('/api/turnstile/diagnose');
-                  const d = await res.json();
-                  if (!res.ok) { box.innerText = d.error || '自检失败'; return; }
-                  const lines = [];
-                  lines.push('状态：' + (d.enabled ? '已开启' : '未开启') + '（容错模式：' + (d.mode === 'lenient' ? '宽松' : '严格') + '）');
-                  lines.push('当前域名：' + d.host);
-                  if (d.enabled) lines.push('Secret Key 有效性：' + (d.secretKeyValid ? '✅ 有效' : '❌ 无效'));
-                  if (d.serverCodes && d.serverCodes.length) lines.push('服务端错误码：' + d.serverCodes.join(', '));
-                  lines.push('结论：' + d.message);
-                  if (d.suggestions && d.suggestions.length) {
-                      lines.push('修复建议：');
-                      d.suggestions.forEach(function (s, i) { lines.push((i + 1) + '. ' + s); });
-                  }
-                  box.innerText = lines.join('\n');
-              } catch (e) {
-                  box.innerText = '网络错误：' + e.message;
-              } finally {
-                  btn.disabled = false;
-              }
           }
 
           async function loadSettings() {
@@ -2501,8 +2026,6 @@ export default {
           window.openSettings = openSettings;
           window.saveSettings = saveSettings;
           window.clearSettings = clearSettings;
-          window.saveMode = saveMode;
-          window.runSettingsDiagnose = runSettingsDiagnose;
 
           function logout() { fetch('/api/auth/logout', {method:'POST'}).then(() => window.location.href = '/login'); }
           init();
