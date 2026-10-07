@@ -21,6 +21,7 @@
 | Worker 名称 | `aurora-accounting` | `aurora-accounting-multi` |
 | 适用场景 | 自己一个人用 | 家人 / 朋友各自注册账号 |
 | 找回密码 | 无 | 用安全问题找回 |
+| 注册开关 | 第一个账号注册后**自动关闭**，管理员可在 ⚙️ 里临时开启 | 始终开放 |
 | 人机验证 | Turnstile，可在应用内 ⚙️ 系统设置里开 | 注册时的算术题（轻量，挡不住有心人） |
 | 应用内系统设置 | 有 | 无 |
 | 注册限流 | 无（靠 Turnstile 兜） | 有，20 次/小时/IP |
@@ -133,7 +134,21 @@ Deployed aurora-accounting triggers
 > 部署完成后可以在 Dashboard → Worker → **Settings → Bindings** 里看到
 > `ACCOUNTING_KV`（KV Namespace）和 `ACCOUNTING_BUCKET`（R2 Bucket）已经绑好。
 
-### 第 4 步（可选，仅个人版）：在应用内开启人机验证
+### 第 4 步（个人版，自动生效）：注册开关
+
+第一个账号注册完成后，注册入口会**自动关闭**——陌生人拿到你的 `*.workers.dev`
+地址也没法自助注册，登录页底部的「没有账号？点击注册」会变成「注册已关闭」。
+
+- **判定规则**：KV 里只要存在任意账号（前缀 `u_`）就算「注册已完成」。
+  也就是说流程是「部署 → 立刻注册你自己的账号」，越早注册窗口越小。
+- **想再开一个号**：用管理员账号登录 → 右上角 **⚙️** → 「注册开关」→ 点「开启注册」，
+  开完**记得再点一次关掉**（按钮会变成「关闭注册」）。
+- **零配置**：不写初始化脚本、不改环境变量、不需要迁移历史数据，升级即生效。
+- ⚠️ **部署后请尽快注册**：开关只在「库里还没有账号」时开放。万一被陌生人抢先在
+  你的实例上注册，他会成为管理员。真被抢了就去 Dashboard → Worker → KV，
+  删掉对应的 `u_<用户名>` 和 `sys_admin` 两个 key，再重新注册即可。
+
+### 第 5 步（可选，仅个人版）：在应用内开启人机验证
 
 **不用碰 Cloudflare 控制台**。Turnstile 的密钥存在 KV 里，由管理员在应用内维护。
 
@@ -155,7 +170,7 @@ Deployed aurora-accounting triggers
 | --- | --- |
 | `wrangler.jsonc` | **个人版**部署配置：KV / R2 绑定（不写 id、不写 bucket_name = 触发自动创建 + 自动绑定） |
 | `wrangler.multiplayer.jsonc` | **多人注册版**部署配置，写法同上，Worker 名称不同 |
-| `index.js` | 个人版入口：路由、鉴权、API、应用内系统设置、内联前端页面、PWA Manifest、Service Worker |
+| `index.js` | 个人版入口：路由、鉴权、API、注册开关、应用内系统设置、内联前端页面、PWA Manifest、Service Worker |
 | `Multiplayer.js` | 多人注册版入口：多账号注册 + 安全问题找回密码，无 Turnstile |
 | `package.json` | 固定 wrangler 版本，提供两套 `dev` / `deploy` / `tail` / `check` 脚本 |
 | `.dev.vars.example` | 本地开发的变量模板（本项目不需要环境变量，留作备用） |
@@ -169,7 +184,7 @@ Deployed aurora-accounting triggers
 | `session_<token>` | 登录会话，24 小时过期 |
 | `limit_<IP>` | 登录失败计数，15 分钟窗口 |
 | `sys_admin` | 管理员账号的 `userId`（第一个注册的用户） |
-| `sys_settings` | 系统设置：Turnstile 的 Site Key / Secret Key、更新人、更新时间 |
+| `sys_settings` | 系统设置：Turnstile 的 Site Key / Secret Key、注册开关 `allowRegistration`、更新人、更新时间 |
 
 账单数据不在 KV 里，而是 R2 上的 `transactions_<userId>.json`。
 
@@ -273,6 +288,20 @@ npm run tail:multiplayer
 先确认两项都填了（只填一项接口会直接报 400）。另外密钥是**服务端渲染**进登录页的，
 需要重新打开一次登录页才生效，不是即时刷新。
 
+**登录页的「注册」入口不见了 / 提示「注册已关闭」**
+这是设计如此（仅个人版）：第一个账号注册完成后注册自动关闭，防止陌生人自助注册。
+要给家人开号，用管理员账号登录 → **⚙️** → 「注册开关」→「开启注册」，
+新账号注册完记得再关掉。
+
+**刚部署完就被陌生人注册成了管理员**
+说明开放窗口期被人抢先注册了。去 Dashboard → Worker → KV，删掉对方的
+`u_<用户名>` 和 `sys_admin` 两个 key，然后立刻自己注册（此时开关会重新开放）。
+更稳妥的做法是：部署完**第一时间**注册自己的账号。
+
+**多人版会不会也自动关注册？**
+不会。多人版是给人各自注册用的，注册始终开放（有 20 次/小时/IP 的限流）。
+自动关闭注册是**个人版专属**行为。
+
 **右上角没有 ⚙️ 系统设置入口**
 只有个人版的管理员能看到。规则是「第一个注册的账号」。想换管理员的话，去
 Dashboard → Worker → KV 里把 `sys_admin` 的值改成目标账号的 `userId` 即可。
@@ -313,6 +342,9 @@ iOS 需要在 Safari 里「添加到主屏幕」。
 
 个人版额外：
 
+- **注册默认关闭**：KV 里出现第一个账号后，`/api/auth/register` 直接返回 **403**，
+  登录页也不再渲染注册入口（由服务端渲染决定，不是前端把按钮藏起来），
+  只有管理员能在系统设置里临时开启
 - 登录失败按 IP 计数，**15 分钟内 5 次**即锁定
 - **系统设置仅管理员可读写**，普通账号访问 `/api/settings` 一律 403
 - Turnstile 的 **Secret Key 只存服务端 KV，接口只返回掩码**，永不下发到浏览器

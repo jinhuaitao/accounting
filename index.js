@@ -79,7 +79,9 @@ export default {
   
         if (path === '/login') {
           const settings = await getSystemSettings(env);
-          return new Response(getLoginPageHTML(settings), {
+          // 注册开关要在服务端渲染进登录页：关闭时不渲染注册入口，也不给「点击注册」的按钮
+          const registrationOpen = await isRegistrationOpen(env);
+          return new Response(getLoginPageHTML(settings, registrationOpen), {
             headers: { 'Content-Type': 'text/html', 'Cache-Control': 'no-store', ...securityHeaders },
           });
         }
@@ -201,6 +203,34 @@ export default {
   }
 
   // ==========================================================================
+  //  6.1 注册开关（个人版专属）
+  //      个人版是「一个人自己用」的场景，但部署在公网（*.workers.dev）上，
+  //      任何人拿到地址都能自助注册账号。所以规则定为：
+  //        · 库里还没有任何账号  → 开放（否则第一个人永远进不来）
+  //        · 已经存在任意账号    → 注册【自动关闭】
+  //        · 管理员在「系统设置」里显式打开 → 临时重新放开
+  //      不需要初始化脚本，也不需要迁移历史数据，升级后立即生效。
+  // ==========================================================================
+  async function hasAnyUser(env) {
+    try {
+      // 优先读单键：第一个账号注册时会写入 sys_admin，单键 get 比 list 传播更快。
+      // KV 的 list 存在最终一致性延迟，只靠 list 的话，第一个账号刚注册完的
+      // 几十秒内窗口可能还开着，正好是最容易被抢注的时间段。
+      if (await env.ACCOUNTING_KV.get(ADMIN_KEY)) return true;
+      const listed = await env.ACCOUNTING_KV.list({ prefix: 'u_', limit: 1 });
+      return listed.keys.length > 0;
+    } catch (e) {
+      return false; // 读不到就当作「还没有账号」，保证冷启动时第一个人能注册
+    }
+  }
+
+  async function isRegistrationOpen(env) {
+    if (!(await hasAnyUser(env))) return true;   // 冷启动：必须先让第一个人注册进来
+    const settings = await getSystemSettings(env);
+    return settings.allowRegistration === true;  // 默认关闭，只有管理员显式开启才放开
+  }
+
+  // ==========================================================================
   //  7. Cloudflare Turnstile 验证
   //     以「系统设置里是否同时配好 Site Key 与 Secret Key」为开关。
   //     没配 → 自动关闭人机验证，保证一键部署后即可注册登录。
@@ -283,6 +313,12 @@ export default {
     // --- 1. 注册接口 ---
     if (path === '/api/auth/register' && method === 'POST') {
       try {
+        // 注册开关：第一个账号注册完成后，注册入口自动关闭。
+        // 放在最前面——既省掉无谓的 PBKDF2 开销，也不给关闭后的注册请求留任何旁路。
+        if (!(await isRegistrationOpen(env))) {
+          return new Response(JSON.stringify({ error: '注册已关闭，仅管理员可在系统设置中重新开启' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+        }
+
         const { username, password, cfToken } = await request.json();
         if (!username || !password) return new Response(JSON.stringify({ error: '请输入账号和密码' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 
@@ -441,6 +477,9 @@ export default {
           turnstileSecretKeySet: Boolean(s.turnstileSecretKey),
           turnstileSecretKeyMasked: maskSecret(s.turnstileSecretKey),
           turnstileEnabled: isTurnstileEnabled(s),
+          // 注册开关：allowRegistration 是管理员的选择，registrationOpen 是当前实际是否可注册
+          allowRegistration: s.allowRegistration === true,
+          registrationOpen: await isRegistrationOpen(env),
           updatedAt: s.updatedAt || null,
           updatedBy: s.updatedBy || null
         }), { headers: { 'Content-Type': 'application/json' } });
@@ -461,6 +500,11 @@ export default {
           secretKey = String(body.turnstileSecretKey).trim().slice(0, 256);
         }
 
+        // 注册开关：只认真正的布尔值，传别的类型一律按「关闭」处理，不传则保持不变
+        const allowRegistration = body.allowRegistration === undefined
+          ? s.allowRegistration === true
+          : body.allowRegistration === true;
+
         if (siteKey && !secretKey) {
           return new Response(JSON.stringify({ error: '只填了 Site Key：Secret Key 也必须填，否则验证码无法通过校验' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
@@ -472,6 +516,7 @@ export default {
           ...s,
           turnstileSiteKey: siteKey,
           turnstileSecretKey: secretKey,
+          allowRegistration: allowRegistration,
           updatedAt: Date.now(),
           updatedBy: currentUser.username
         };
@@ -483,6 +528,8 @@ export default {
           turnstileSecretKeySet: Boolean(next.turnstileSecretKey),
           turnstileSecretKeyMasked: maskSecret(next.turnstileSecretKey),
           turnstileEnabled: isTurnstileEnabled(next),
+          allowRegistration: next.allowRegistration === true,
+          registrationOpen: await isRegistrationOpen(env),
           updatedAt: next.updatedAt,
           updatedBy: next.updatedBy
         }), { headers: { 'Content-Type': 'application/json' } });
@@ -825,13 +872,17 @@ export default {
   }
   
   // --- 登录/注册页面 (HTML + JS) ---
-  function getLoginPageHTML(settings) {
+  // registrationOpen：第一个账号注册完成后为 false，登录页不再渲染注册入口
+  function getLoginPageHTML(settings, registrationOpen = true) {
       const iconBase64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48ZGVmcz48bGluZWFyR3JhZGllbnQgaWQ9ImEiIHgxPSIwIiB5MT0iMCIgeDI9IjUxMiIgeTI9IjUxMiIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPjxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzYzNjZmMSIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iI2E4NTVmNyIvPjwvbGluZWFyR3JhZGllbnQ+PC9kZWZzPjxyZWN0IHdpZHRoPSI1MTIiIGhlaWdodD0iNTEyIiByeD0iMTI4IiBmaWxsPSJ1cmwoI2EpIi8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTI1NiAxMjhsLTMyIDgwSDEyOGw4MCAzMi04MCAzMmg5NmwzMiA4MEwyNTYgNDAwTDI4OCAyNTZoOTZsMzItODBoLTk2ek0yNTYgMTkybDMyIDgwaDk2bDMyLTgwaC05NnoiLz48L3N2Zz4=";
 
       // Turnstile 配置来自 KV 里的「系统设置」（由管理员在应用内维护），
       // 不再依赖 Cloudflare 环境变量。两个密钥都配好才会渲染验证码组件。
       const turnstileSiteKey = (settings && settings.turnstileSiteKey) ? String(settings.turnstileSiteKey) : '';
       const turnstileEnabled = Boolean(turnstileSiteKey && settings && settings.turnstileSecretKey);
+
+      // 注册开关：由调用方（/login 路由）算好后传进来
+      const registrationEnabled = Boolean(registrationOpen);
 
       return `<!DOCTYPE html>
   <html lang="zh-CN">
@@ -907,6 +958,8 @@ export default {
           
           .switch-mode { margin-top: 24px; font-size: 14px; color: #94a3b8; cursor: pointer; transition: 0.3s; }
           .switch-mode:hover { color: white; text-decoration: underline; }
+          .switch-mode.disabled { cursor: default; opacity: 0.5; }
+          .switch-mode.disabled:hover { color: #94a3b8; text-decoration: none; }
           
           .error { color: #f43f5e; font-size: 14px; margin-bottom: 20px; display: none; background: rgba(244,63,94,0.15); padding: 12px; border-radius: 16px; animation: shake 0.5s cubic-bezier(.36,.07,.19,.97) both; }
           @keyframes shake { 10%, 90% { transform: translate3d(-1px, 0, 0); } 20%, 80% { transform: translate3d(2px, 0, 0); } 30%, 50%, 70% { transform: translate3d(-4px, 0, 0); } 40%, 60% { transform: translate3d(4px, 0, 0); } }
@@ -940,12 +993,15 @@ export default {
               <button type="submit" id="btn">立即登录</button>
           </form>
           
-          <div class="switch-mode" id="switchBtn" onclick="toggleMode()">没有账号？点击注册</div>
+          ${registrationEnabled
+              ? '<div class="switch-mode" id="switchBtn" onclick="toggleMode()">没有账号？点击注册</div>'
+              : '<div class="switch-mode disabled" id="switchBtn">注册已关闭 · 仅管理员可开启</div>'}
       </div>
   
       <script>
           let isLogin = true;
           const TURNSTILE_ENABLED = ${turnstileEnabled};
+          const REGISTRATION_OPEN = ${registrationEnabled};
   
           const els = {
               title: document.getElementById('title'),
@@ -961,6 +1017,12 @@ export default {
           };
   
           function toggleMode() {
+              // 注册已关闭时只做提示，不切换表单。
+              // 后端 /api/auth/register 同样会拒绝，这里是双保险 + 更友好的反馈。
+              if (isLogin && !REGISTRATION_OPEN) {
+                  showError('注册已关闭，仅管理员可在系统设置中重新开启');
+                  return;
+              }
               isLogin = !isLogin;
               els.error.style.display = 'none';
               
@@ -1572,6 +1634,18 @@ export default {
               <div class="stat-val" id="settingsWho" style="font-size:14px;">-</div>
           </div>
 
+          <div class="stat-box" style="margin-bottom:20px;background:rgba(0,0,0,0.2);">
+              <div class="stat-title">注册开关</div>
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:6px;">
+                  <div class="stat-val" id="settingsRegState" style="font-size:13px;line-height:1.4;">读取中...</div>
+                  <button type="button" id="settingsRegBtn" onclick="toggleRegistration()" style="flex-shrink:0;padding:8px 16px;border-radius:99px;border:1px solid var(--border-glass);background:rgba(125,125,125,0.12);color:var(--text);font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;">切换</button>
+              </div>
+              <div style="font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.6;">
+                  第一个账号注册完成后<b>自动关闭</b>，陌生人无法再自助注册。<br>
+                  需要给家人开号时临时开启，用完记得关掉。
+              </div>
+          </div>
+
           <div style="font-size:12px;color:var(--text-muted);line-height:1.8;margin-bottom:20px;">
               Turnstile 人机验证用于阻挡机器人注册与撞库。<br>
               密钥保存在服务端 KV，<b>不会下发到浏览器</b>；两项都填才会生效，<br>
@@ -1904,6 +1978,7 @@ export default {
           let me = null;
           let clearArmed = false;
           let clearTimer = null;
+          let settingsState = null; // 最近一次读到的系统设置，供「注册开关」按钮取反
 
           async function loadMe() {
               try {
@@ -1930,13 +2005,52 @@ export default {
 
           // Secret Key 永不回显，只显示掩码提示
           function renderSettingsState(d) {
+              settingsState = d;
               const secretInput = document.getElementById('setSecretKey');
               secretInput.value = '';
               secretInput.placeholder = d.turnstileSecretKeySet
                   ? ('已配置：' + d.turnstileSecretKeyMasked + '（留空则不修改）')
                   : '未配置';
               document.getElementById('settingsStatus').innerText = d.turnstileEnabled ? '✅ 已开启' : '⚪ 未开启';
+
+              // 注册开关状态
+              const regState = document.getElementById('settingsRegState');
+              const regBtn = document.getElementById('settingsRegBtn');
+              if (regState && regBtn) {
+                  regState.innerText = d.allowRegistration
+                      ? '已开启 · 允许自助注册'
+                      : '已关闭 · 仅现有账号可登录';
+                  regBtn.innerText = d.allowRegistration ? '关闭注册' : '开启注册';
+              }
           }
+
+          // 注册开关：默认在第一个账号注册完成后自动关闭，这里只做「临时开启 / 再关闭」
+          async function toggleRegistration() {
+              const hint = document.getElementById('settingsHint');
+              const btn = document.getElementById('settingsRegBtn');
+              const next = !(settingsState && settingsState.allowRegistration);
+
+              btn.disabled = true;
+              try {
+                  const res = await fetch('/api/settings', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ allowRegistration: next })
+                  });
+                  const d = await res.json();
+                  if (!res.ok) throw new Error(d.error || '操作失败');
+                  renderSettingsState(d);
+                  hint.innerText = next
+                      ? '已开启注册。新账号注册完成后请及时关闭。'
+                      : '已关闭注册。登录页的注册入口会一并消失。';
+                  vibrate();
+              } catch (e) {
+                  hint.innerText = e.message;
+              } finally {
+                  btn.disabled = false;
+              }
+          }
+          window.toggleRegistration = toggleRegistration;
 
           async function loadSettings() {
               const hint = document.getElementById('settingsHint');
