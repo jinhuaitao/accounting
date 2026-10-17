@@ -68,7 +68,7 @@ git push -u origin main
 
 ### 第 2 步：在 Cloudflare 连接仓库（**选版本就在这一步**）
 
-1. 打开 [Cloudflare Dashboard](https://dash.cloudflare.com) → 左侧 **Workers & Pages**
+1. 打开 [Cloudflare Dashboard](https://www.google.com/search?q=https%3A%2F%2Fdash.cloudflare.com) → 左侧 **Workers & Pages**
 2. 点 **Create application** → 在 **Import a repository** 那一栏点 **Get started**
 3. 选 **Git account** → 从列表里选中你的仓库
 4. 进入 **Configure your project** 表单。**版本就是在这里选的**——关键只有两个字段：
@@ -181,7 +181,7 @@ Deployed aurora-accounting triggers
 | KV Key | 内容 |
 | --- | --- |
 | `u_<用户名>` | 账号记录：密码盐 + 派生哈希、`userId`、注册时间 |
-| `session_<token>` | 登录会话，24 小时过期 |
+| `session_<token>` | 登录会话，365 天有效期（活跃使用每 7 天自动滑动续期） |
 | `limit_<IP>` | 登录失败计数，15 分钟窗口 |
 | `sys_admin` | 管理员账号的 `userId`（第一个注册的用户） |
 | `sys_settings` | 系统设置：Turnstile 的 Site Key / Secret Key、注册开关 `allowRegistration`、更新人、更新时间 |
@@ -331,7 +331,7 @@ iOS 需要在 Safari 里「添加到主屏幕」。
 两个版本共用的部分：
 
 - 密码用 **PBKDF2-SHA256 + 随机盐，10 万次迭代**，只存派生结果，不存明文
-- 会话 Token 为 **32 字节 CSPRNG 随机值**，存 KV，24 小时过期
+- 会话 Token 为 **32 字节 CSPRNG 随机值**，存 KV，365 天有效期（每 7 天自动滑动续期）
 - Cookie 带 `HttpOnly` + `SameSite=Strict` + `Secure`
 - 所有用户输入经过 HTML 转义；账单字段有长度上限
 - 每个用户的数据按 `userId` 隔离在独立 R2 对象中，删除时校验归属

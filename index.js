@@ -20,10 +20,11 @@ export default {
       }
   
       try {
-        // 路由守卫
+        // 路由守卫（含滑动续期检查）
+        let renewCookie = null;
         if (path !== '/login' && !path.startsWith('/api/auth') && path !== '/manifest.json' && path !== '/sw.js') {
-          const isAuthenticated = await checkAuthentication(request, env);
-          if (!isAuthenticated) {
+          const authResult = await checkAuthentication(request, env);
+          if (!authResult.ok) {
             // API 请求：返回 401 JSON。
             // 旧版本统一返回「302 + 登录页 HTML」，前端 fetch 会自动跟随跳转，
             // 拿到 HTML 后 res.json() 直接抛异常，会话过期时表现成「莫名其妙的报错」。
@@ -39,13 +40,14 @@ export default {
               headers: { 'Location': '/login', ...securityHeaders },
             });
           }
+          renewCookie = authResult.renewCookie;
         }
   
         // 首页 HTML
         if (path === '/') {
-          return new Response(getHTML(), {
-            headers: { 'Content-Type': 'text/html', ...securityHeaders },
-          });
+          const headers = new Headers({ 'Content-Type': 'text/html', ...securityHeaders });
+          if (renewCookie) headers.set('Set-Cookie', renewCookie);
+          return new Response(getHTML(), { headers });
         }
   
         // API 路由
@@ -54,6 +56,9 @@ export default {
           Object.entries(securityHeaders).forEach(([key, value]) => {
             response.headers.set(key, value);
           });
+          if (renewCookie && !response.headers.has('Set-Cookie')) {
+            response.headers.set('Set-Cookie', renewCookie);
+          }
           return response;
         }
   
@@ -258,7 +263,18 @@ export default {
     }
   }
   
-  // --- 鉴权逻辑 ---
+  // --- 会话有效期与滑动续期配置 ---
+  // 浏览器 Set-Cookie Max-Age 标准上限为 400 天，此处设为 365 天（31536000 秒）
+  const SESSION_TTL = 365 * 86400;
+  // 滑动续期冷却间隔：7 天（毫秒）。仅当距上次续期超过 7 天（或旧版会话首次升级）时才重写一次 KV，
+  // 保护 Cloudflare Workers KV 免费版每天 1000 次的写入配额。
+  const SESSION_RENEW_INTERVAL = 7 * 86400 * 1000;
+
+  function buildAuthCookie(token, maxAge = SESSION_TTL) {
+    return `auth_token=${token}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=${maxAge}`;
+  }
+
+  // --- 鉴权逻辑（支持滑动自动续期与旧会话无感升级） ---
   async function checkAuthentication(request, env) {
     const cookieHeader = request.headers.get('Cookie') || '';
     const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
@@ -266,11 +282,25 @@ export default {
       acc[name] = value;
       return acc;
     }, {});
-    if (cookies.auth_token) {
-      const storedSession = await env.ACCOUNTING_KV.get(`session_${cookies.auth_token}`);
-      return storedSession !== null;
-    }
-    return false;
+    const token = cookies.auth_token;
+    if (!token) return { ok: false, renewCookie: null };
+
+    const sessionKey = `session_${token}`;
+    const storedSession = await env.ACCOUNTING_KV.get(sessionKey);
+    if (storedSession === null) return { ok: false, renewCookie: null };
+
+    let renewCookie = null;
+    try {
+      const sessionData = JSON.parse(storedSession);
+      const now = Date.now();
+      if (!sessionData.updatedAt || (now - sessionData.updatedAt) > SESSION_RENEW_INTERVAL) {
+        sessionData.updatedAt = now;
+        await env.ACCOUNTING_KV.put(sessionKey, JSON.stringify(sessionData), { expirationTtl: SESSION_TTL });
+        renewCookie = buildAuthCookie(token, SESSION_TTL);
+      }
+    } catch (e) { /* 解析异常不影响当前鉴权通过 */ }
+
+    return { ok: true, renewCookie };
   }
   
   async function getCurrentUser(request, env) {
@@ -364,13 +394,13 @@ export default {
         // 但 Turnstile 的 token 是一次性的，第二次校验必然失败 —— 这个 bug 会让
         // 新用户注册后卡在「自动登录失败」。改为注册时直接建会话即可。
         const token = generateSecureToken();
-        await kv.put(`session_${token}`, JSON.stringify({ userId, username: cleanUsername }), { expirationTtl: 86400 });
+        await kv.put(`session_${token}`, JSON.stringify({ userId, username: cleanUsername, updatedAt: Date.now() }), { expirationTtl: SESSION_TTL });
 
         return new Response(JSON.stringify({ success: true, token }), {
           status: 200,
           headers: {
             'Content-Type': 'application/json',
-            'Set-Cookie': `auth_token=${token}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=86400`
+            'Set-Cookie': buildAuthCookie(token, SESSION_TTL)
           },
         });
       } catch (e) {
@@ -417,13 +447,13 @@ export default {
           await kv.delete(rateLimitKey);
   
           const token = generateSecureToken();
-          await kv.put(`session_${token}`, JSON.stringify({ userId: userData.userId, username: cleanUsername }), { expirationTtl: 86400 });
+          await kv.put(`session_${token}`, JSON.stringify({ userId: userData.userId, username: cleanUsername, updatedAt: Date.now() }), { expirationTtl: SESSION_TTL });
           
           return new Response(JSON.stringify({ success: true, token }), {
             status: 200,
             headers: { 
               'Content-Type': 'application/json',
-              'Set-Cookie': `auth_token=${token}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=86400`
+              'Set-Cookie': buildAuthCookie(token, SESSION_TTL)
             },
           });
         }
@@ -735,7 +765,7 @@ export default {
   
   function getServiceWorker() {
     return `
-  const CACHE_NAME = 'aurora-app-v33-secure';
+  const CACHE_NAME = 'aurora-app-v34-secure';
   const urlsToCache = [
     '/manifest.json',
     'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js',
@@ -760,13 +790,15 @@ export default {
     // 2) 非 GET 请求直接放行
     if (e.request.method !== 'GET') return;
 
-    // 3) 页面导航：网络优先，离线时回退缓存
+    // 3) 页面导航：网络优先，离线时回退缓存（仅缓存未重定向的正常页面，避免将 302 登录页缓存为首页）
     if (e.request.mode === 'navigate') {
         e.respondWith(
             fetch(e.request)
                 .then(res => {
-                    const copy = res.clone();
-                    caches.open(CACHE_NAME).then(c => c.put(e.request, copy));
+                    if (res && res.ok && !res.redirected && url.pathname !== '/login') {
+                        const copy = res.clone();
+                        caches.open(CACHE_NAME).then(c => c.put(e.request, copy));
+                    }
                     return res;
                 })
                 .catch(() => caches.match(e.request).then(r => r || new Response('<h1>离线中</h1><p>请检查网络后重试。</p>', { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } })))
@@ -1785,7 +1817,7 @@ export default {
               element.style.height = element.offsetHeight + 'px'; element.style.transition = 'all 0.4s ease';
               requestAnimationFrame(() => { element.style.height = '0'; element.style.marginBottom = '0'; element.style.opacity = '0'; element.style.transform = 'scale(0.9)'; });
               closeAll();
-              const res = await fetch('/api/transactions/' + id, { method: 'DELETE' });
+              const res = await apiFetch('/api/transactions/' + id, { method: 'DELETE' });
               const updatedList = await res.json();
               setTimeout(() => { renderList(updatedList); loadSummaryOnly(); refreshChart(); }, 400);
           }
@@ -1831,13 +1863,21 @@ export default {
               }
           }
           
+          async function apiFetch(url, options) {
+              const res = await fetch(url, options);
+              if (res.status === 401) {
+                  window.location.href = '/login';
+                  throw new Error('UNAUTHORIZED');
+              }
+              return res;
+          }
           async function refreshChart() { if (state.period === 'monthly') await loadDailyChart(); if (state.period === 'yearly') await loadYearlyChart(); if (state.period === 'weekly') await loadWeeklyChart(); }
-          async function loadData() { try { const [txRes, sumRes] = await Promise.all([ fetch('/api/transactions'), fetch('/api/summary?period=' + state.period) ]); const transactions = await txRes.json(); const summary = await sumRes.json(); renderSummary(summary); renderList(transactions); } catch (e) { console.error(e); } }
-          async function loadSummaryOnly() { try { const sumRes = await fetch('/api/summary?period=' + state.period); renderSummary(await sumRes.json()); } catch (e) {} }
+          async function loadData() { try { const [txRes, sumRes] = await Promise.all([ apiFetch('/api/transactions'), apiFetch('/api/summary?period=' + state.period) ]); const transactions = await txRes.json(); const summary = await sumRes.json(); renderSummary(summary); renderList(transactions); } catch (e) { if (e && e.message !== 'UNAUTHORIZED') console.error(e); } }
+          async function loadSummaryOnly() { try { const sumRes = await apiFetch('/api/summary?period=' + state.period); renderSummary(await sumRes.json()); } catch (e) {} }
           
-          async function loadDailyChart() { const now = new Date(); const res = await fetch(\`/api/daily_balance?year=\${now.getFullYear()}&month=\${now.getMonth() + 1}\`); renderChart((await res.json()).map(d => ({ label: d.day, value: d.balance })), '日'); }
-          async function loadYearlyChart() { const res = await fetch(\`/api/monthly_balance?year=\${new Date().getFullYear()}\`); renderChart((await res.json()).map(d => ({ label: d.month, value: d.balance })), '月'); }
-          async function loadWeeklyChart() { const res = await fetch(\`/api/weekly_balance\`); renderChart((await res.json()).map(d => ({ label: d.day, value: d.balance })), ''); }
+          async function loadDailyChart() { const now = new Date(); const res = await apiFetch(\`/api/daily_balance?year=\${now.getFullYear()}&month=\${now.getMonth() + 1}\`); renderChart((await res.json()).map(d => ({ label: d.day, value: d.balance })), '日'); }
+          async function loadYearlyChart() { const res = await apiFetch(\`/api/monthly_balance?year=\${new Date().getFullYear()}\`); renderChart((await res.json()).map(d => ({ label: d.month, value: d.balance })), '月'); }
+          async function loadWeeklyChart() { const res = await apiFetch(\`/api/weekly_balance\`); renderChart((await res.json()).map(d => ({ label: d.day, value: d.balance })), ''); }
   
           function renderChart(data, suffix) {
                const ctx = document.getElementById('dailyBalanceChart').getContext('2d');
@@ -1968,10 +2008,10 @@ export default {
           document.getElementById('addForm').onsubmit = async (e) => {
               e.preventDefault(); const btn = e.target.querySelector('button'); btn.disabled = true; btn.innerText = '保存中...';
               try { 
-                  const res = await fetch('/api/transactions', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ type: state.type, amount: document.getElementById('amount').value, category: document.getElementById('category').value, description: document.getElementById('desc').value }) }); 
+                  const res = await apiFetch('/api/transactions', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ type: state.type, amount: document.getElementById('amount').value, category: document.getElementById('category').value, description: document.getElementById('desc').value }) }); 
                   const updatedList = await res.json(); document.getElementById('amount').value = ''; document.getElementById('desc').value = ''; closeAll(); 
                   renderList(updatedList); loadSummaryOnly(); refreshChart();
-              } catch(e) { alert('保存失败'); } finally { btn.disabled = false; btn.innerText = '确认保存'; }
+              } catch(e) { if (e && e.message !== 'UNAUTHORIZED') alert('保存失败'); } finally { btn.disabled = false; btn.innerText = '确认保存'; }
           };
   
           // ==================== 系统设置（仅管理员可见） ====================
